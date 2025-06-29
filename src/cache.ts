@@ -1,135 +1,284 @@
 import * as cache from '@actions/cache'
 import * as core from '@actions/core'
-import * as glob from '@actions/glob'
-import * as crypto from 'crypto'
 import * as fs from 'fs'
+import * as path from 'path'
+import { Tool, ToolCacheInfo, CacheResult } from './types'
 import { miseDir, getSystemInfo } from './utils'
+import { generateToolHash } from './tools'
 
 /**
- * Restore mise cache based on configuration files
+ * Restore both global mise cache and individual tool caches
  */
-export async function restoreMiseCache(): Promise<string | undefined> {
-  core.startGroup('Restoring mise cache')
+export async function restoreAllCaches(tools: Tool[]): Promise<CacheResult> {
+  core.startGroup('Restoring caches')
 
   try {
-    const version = core.getInput('version')
-    const installArgs = core.getInput('install_args')
-    const { MISE_ENV } = process.env
-    const cachePath = miseDir()
-
-    const fileHash = await generateConfigHash()
     const systemInfo = await getSystemInfo()
-    const prefix = core.getInput('cache_key_prefix') || 'mise-v0'
+    const version = core.getInput('version') || 'latest'
+    const keyPrefix = core.getInput('cache_key_prefix') || 'mise-v1'
 
-    let primaryKey = `${prefix}-${systemInfo.target}-${fileHash}`
+    // Restore global mise cache
+    const globalCacheHit = await restoreGlobalMiseCache(
+      systemInfo.target,
+      version,
+      keyPrefix
+    )
 
-    if (version) {
-      primaryKey = `${primaryKey}-${version}`
+    // Restore individual tool caches
+    const toolCacheResults = await restoreToolCaches(
+      tools,
+      systemInfo.target,
+      keyPrefix
+    )
+
+    const cachedTools = toolCacheResults.filter(t => t.isRestored).length
+    const missingTools = toolCacheResults
+      .filter(t => !t.isRestored)
+      .map(t => t.tool)
+
+    const result: CacheResult = {
+      globalCacheHit,
+      toolCacheResults,
+      totalTools: tools.length,
+      cachedTools,
+      missingTools
     }
 
-    if (MISE_ENV) {
-      primaryKey = `${primaryKey}-${MISE_ENV}`
-    }
+    // Set outputs for GitHub Actions
+    setOutputs(result)
+    logCacheResults(result)
 
-    if (installArgs) {
-      const toolsHash = generateToolsHash(installArgs)
-      primaryKey = `${primaryKey}-${toolsHash}`
-    }
-
-    // Save state for later use
-    core.saveState('PRIMARY_KEY', primaryKey)
-    core.saveState('MISE_DIR', cachePath)
-
-    const cacheKey = await cache.restoreCache([cachePath], primaryKey)
-    core.setOutput('cache-hit', Boolean(cacheKey))
-
-    if (!cacheKey) {
-      core.info(`mise cache not found for ${primaryKey}`)
-      return primaryKey
-    }
-
-    core.info(`mise cache restored from key: ${cacheKey}`)
-    return cacheKey
+    return result
   } catch (error) {
-    core.warning(`Failed to restore mise cache: ${error}`)
-    core.setOutput('cache-hit', false)
-    return undefined
+    core.warning(`Failed to restore caches: ${error}`)
+    return {
+      globalCacheHit: false,
+      toolCacheResults: tools.map(tool => ({
+        tool,
+        cacheKey: '',
+        cachePath: '',
+        isRestored: false
+      })),
+      totalTools: tools.length,
+      cachedTools: 0,
+      missingTools: tools
+    }
   } finally {
     core.endGroup()
   }
 }
 
 /**
- * Save mise cache
+ * Restore global mise binary cache
  */
-export async function saveMiseCache(cacheKey: string): Promise<void> {
-  return core.group('Saving mise cache', async () => {
-    const cachePath = miseDir()
+async function restoreGlobalMiseCache(
+  target: string,
+  version: string,
+  keyPrefix: string
+): Promise<boolean> {
+  const globalCacheKey = `${keyPrefix}-${target}-${version}-global`
+  const miseCachePath = path.join(miseDir(), 'bin')
 
-    if (!fs.existsSync(cachePath)) {
-      throw new Error(`Cache folder path does not exist on disk: ${cachePath}`)
+  core.info(`Checking global mise cache: ${globalCacheKey}`)
+
+  try {
+    const cacheKey = await cache.restoreCache([miseCachePath], globalCacheKey)
+    const hit = Boolean(cacheKey)
+
+    if (hit) {
+      core.info(`✓ Global mise cache restored: ${cacheKey}`)
+    } else {
+      core.info(`✗ Global mise cache not found`)
     }
+
+    return hit
+  } catch (error) {
+    core.warning(`Failed to restore global mise cache: ${error}`)
+    return false
+  }
+}
+
+/**
+ * Restore individual tool caches
+ */
+async function restoreToolCaches(
+  tools: Tool[],
+  target: string,
+  keyPrefix: string
+): Promise<ToolCacheInfo[]> {
+  const results: ToolCacheInfo[] = []
+
+  for (const tool of tools) {
+    const toolHash = generateToolHash(tool)
+    const toolCacheKey = `${keyPrefix}-${target}-tool-${toolHash}`
+    const toolCachePath = path.join(
+      miseDir(),
+      'installs',
+      tool.name,
+      tool.version
+    )
+
+    core.info(`Checking tool cache: ${tool.name}@${tool.version}`)
 
     try {
-      const cacheId = await cache.saveCache([cachePath], cacheKey)
-      if (cacheId === -1) {
-        core.info('Cache not saved (already exists)')
-        return
+      const cacheKey = await cache.restoreCache([toolCachePath], toolCacheKey)
+      const isRestored = Boolean(cacheKey)
+
+      if (isRestored) {
+        core.info(`  ✓ Restored from cache: ${cacheKey}`)
+      } else {
+        core.info(`  ✗ Not found in cache`)
       }
 
-      core.info(`Cache saved from ${cachePath} with key: ${cacheKey}`)
+      results.push({
+        tool,
+        cacheKey: toolCacheKey,
+        cachePath: toolCachePath,
+        isRestored
+      })
     } catch (error) {
-      core.warning(`Failed to save mise cache: ${error}`)
+      core.warning(`Failed to restore cache for ${tool.name}: ${error}`)
+      results.push({
+        tool,
+        cacheKey: toolCacheKey,
+        cachePath: toolCachePath,
+        isRestored: false
+      })
     }
-  })
+  }
+
+  return results
 }
 
 /**
- * Generate hash from configuration files
+ * Save caches for newly installed tools and global mise
  */
-async function generateConfigHash(): Promise<string> {
-  const configPatterns = [
-    `**/.config/mise/config.toml`,
-    `**/.config/mise/config.lock`,
-    `**/.config/mise/config.*.toml`,
-    `**/.config/mise/config.*.lock`,
-    `**/.config/mise.toml`,
-    `**/.config/mise.lock`,
-    `**/.config/mise.*.toml`,
-    `**/.config/mise.*.lock`,
-    `**/.mise/config.toml`,
-    `**/.mise/config.lock`,
-    `**/.mise/config.*.toml`,
-    `**/.mise/config.*.lock`,
-    `**/mise/config.toml`,
-    `**/mise/config.lock`,
-    `**/mise/config.*.toml`,
-    `**/mise/config.*.lock`,
-    `**/.mise.toml`,
-    `**/.mise.lock`,
-    `**/.mise.*.toml`,
-    `**/.mise.*.lock`,
-    `**/mise.toml`,
-    `**/mise.lock`,
-    `**/mise.*.toml`,
-    `**/mise.*.lock`,
-    `**/.tool-versions`
-  ]
+export async function saveAllCaches(
+  cacheResult: CacheResult,
+  installedTools: Tool[]
+): Promise<void> {
+  if (!core.getBooleanInput('cache_save')) {
+    core.info('Cache saving disabled, skipping...')
+    return
+  }
 
-  return await glob.hashFiles(configPatterns.join('\n'))
+  core.startGroup('Saving caches')
+
+  try {
+    // Save global mise cache if it wasn't restored
+    if (!cacheResult.globalCacheHit) {
+      await saveGlobalMiseCache()
+    }
+
+    // Save caches for newly installed tools
+    for (const tool of installedTools) {
+      const toolCacheInfo = cacheResult.toolCacheResults.find(
+        t => t.tool.name === tool.name && t.tool.version === tool.version
+      )
+
+      if (toolCacheInfo && !toolCacheInfo.isRestored) {
+        await saveToolCache(toolCacheInfo)
+      }
+    }
+  } catch (error) {
+    core.warning(`Failed to save caches: ${error}`)
+  } finally {
+    core.endGroup()
+  }
 }
 
 /**
- * Generate hash from tools in install arguments
+ * Save global mise binary cache
  */
-function generateToolsHash(installArgs: string): string {
-  const tools = installArgs
-    .split(' ')
-    .filter((arg: string) => !arg.startsWith('-'))
-    .sort()
-    .join(' ')
+async function saveGlobalMiseCache(): Promise<void> {
+  const systemInfo = await getSystemInfo()
+  const version = core.getInput('version') || 'latest'
+  const keyPrefix = core.getInput('cache_key_prefix') || 'mise-v1'
+  const globalCacheKey = `${keyPrefix}-${systemInfo.target}-${version}-global`
+  const miseCachePath = path.join(miseDir(), 'bin')
 
-  if (!tools) return ''
+  if (!fs.existsSync(miseCachePath)) {
+    core.warning(`Global mise path does not exist: ${miseCachePath}`)
+    return
+  }
 
-  return crypto.createHash('sha256').update(tools).digest('hex')
+  try {
+    const cacheId = await cache.saveCache([miseCachePath], globalCacheKey)
+    if (cacheId !== -1) {
+      core.info(`✓ Global mise cache saved: ${globalCacheKey}`)
+    } else {
+      core.info(`Global mise cache already exists: ${globalCacheKey}`)
+    }
+  } catch (error) {
+    core.warning(`Failed to save global mise cache: ${error}`)
+  }
+}
+
+/**
+ * Save individual tool cache
+ */
+async function saveToolCache(toolCacheInfo: ToolCacheInfo): Promise<void> {
+  const { tool, cacheKey, cachePath } = toolCacheInfo
+
+  if (!fs.existsSync(cachePath)) {
+    core.warning(
+      `Tool cache path does not exist for ${tool.name}@${tool.version}: ${cachePath}`
+    )
+    return
+  }
+
+  try {
+    const cacheId = await cache.saveCache([cachePath], cacheKey)
+    if (cacheId !== -1) {
+      core.info(`✓ Tool cache saved: ${tool.name}@${tool.version}`)
+    } else {
+      core.info(`Tool cache already exists: ${tool.name}@${tool.version}`)
+    }
+  } catch (error) {
+    core.warning(`Failed to save tool cache for ${tool.name}: ${error}`)
+  }
+}
+
+/**
+ * Set GitHub Actions outputs based on cache results
+ */
+function setOutputs(result: CacheResult): void {
+  const { totalTools, cachedTools, globalCacheHit } = result
+
+  // Traditional cache-hit output (true only if ALL tools were cached)
+  const fullCacheHit = globalCacheHit && cachedTools === totalTools
+  core.setOutput('cache-hit', fullCacheHit)
+
+  // New enhanced outputs
+  core.setOutput('global-cache-hit', globalCacheHit)
+  core.setOutput('partial-cache-hit', cachedTools > 0)
+  core.setOutput('tools-cache-hit-ratio', `${cachedTools}/${totalTools}`)
+  core.setOutput('cached-tools-count', cachedTools)
+  core.setOutput('missing-tools-count', totalTools - cachedTools)
+}
+
+/**
+ * Log detailed cache results
+ */
+function logCacheResults(result: CacheResult): void {
+  const { totalTools, cachedTools, globalCacheHit, missingTools } = result
+
+  core.info(`\n📊 Cache Results Summary:`)
+  core.info(`  Global mise cache: ${globalCacheHit ? '✓ Hit' : '✗ Miss'}`)
+  core.info(`  Tool caches: ${cachedTools}/${totalTools} restored`)
+
+  if (cachedTools > 0) {
+    core.info(`\n✅ Restored from cache:`)
+    result.toolCacheResults
+      .filter(t => t.isRestored)
+      .forEach(t => core.info(`  - ${t.tool.name}@${t.tool.version}`))
+  }
+
+  if (missingTools.length > 0) {
+    core.info(`\n⚠️  Need to install:`)
+    missingTools.forEach(tool => core.info(`  - ${tool.name}@${tool.version}`))
+  }
+
+  const cacheEfficiency = totalTools > 0 ? (cachedTools / totalTools) * 100 : 0
+  core.info(`\n🎯 Cache efficiency: ${cacheEfficiency.toFixed(1)}%`)
 }

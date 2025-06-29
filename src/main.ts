@@ -1,16 +1,21 @@
 import * as core from '@actions/core'
-import { MiseConfig } from './types'
+import * as path from 'path'
+import { MiseConfig, Tool, CacheResult } from './types'
 import { setupEnvironmentVariables } from './environment'
 import {
   setupMise,
   setupToolVersions,
   setupMiseToml,
   testMise,
-  installTools,
+  installSpecificTools,
+  installAllConfiguredTools,
   listTools,
-  reshimTools
+  reshimTools,
+  trustCurrentDirectory
 } from './setup'
-import { restoreMiseCache, saveMiseCache } from './cache'
+import { restoreAllCaches, saveAllCaches } from './cache'
+import { getAllTools } from './tools'
+import { miseDir } from './utils'
 
 /**
  * Main entry point for the mise action
@@ -20,43 +25,91 @@ export async function run(): Promise<void> {
     // Parse configuration from inputs
     const config = parseConfiguration()
 
-    // Set up configuration files
+    // Set up configuration files first
     await setupConfigurationFiles(config)
 
-    // Handle caching
-    let cacheKey: string | undefined
+    // Parse all tools from various sources
+    const allTools = await getAllTools()
+    core.info(`Discovered ${allTools.length} tools to manage`)
+
+    // Handle caching - restore both global and per-tool caches
+    let cacheResult
     if (core.getBooleanInput('cache')) {
-      cacheKey = await restoreMiseCache()
+      cacheResult = await restoreAllCaches(allTools)
     } else {
       core.setOutput('cache-hit', false)
+      core.setOutput('global-cache-hit', false)
+      core.setOutput('partial-cache-hit', false)
+      core.setOutput('tools-cache-hit-ratio', '0/0')
+      cacheResult = {
+        globalCacheHit: false,
+        toolCacheResults: [],
+        totalTools: allTools.length,
+        cachedTools: 0,
+        missingTools: allTools
+      }
     }
 
-    // Set up mise binary
-    await setupMise(config.version)
+    // Set up mise binary (skip if restored from global cache)
+    if (!cacheResult.globalCacheHit) {
+      await setupMise(config.version)
+    } else {
+      core.info('Mise binary restored from cache, skipping installation')
+      // Still need to add to PATH
+      const miseBinDir = path.join(miseDir(), 'bin')
+      core.addPath(miseBinDir)
+    }
 
     // Set up environment variables
     await setupEnvironmentVariables(config)
 
-    // Reshim if requested
-    if (core.getBooleanInput('reshim')) {
-      await reshimTools()
-    }
+    // Trust current directory for mise configuration
+    await trustCurrentDirectory()
 
     // Test mise installation
     await testMise()
 
-    // Install tools if requested
-    if (core.getBooleanInput('install')) {
-      await installTools(config.installArgs)
+    // Reshim if requested (before installing new tools)
+    if (core.getBooleanInput('reshim')) {
+      await reshimTools()
+    }
 
-      // Save cache if enabled and we have a cache key
-      if (cacheKey && core.getBooleanInput('cache_save')) {
-        await saveMiseCache(cacheKey)
+    // Install tools based on caching results
+    let installedTools: Tool[] = []
+    if (core.getBooleanInput('install')) {
+      if (cacheResult.missingTools.length > 0) {
+        core.info(
+          `Installing ${cacheResult.missingTools.length} tools that weren't found in cache`
+        )
+        installedTools = await installSpecificTools(cacheResult.missingTools)
+      } else {
+        core.info('All tools were restored from cache, no installation needed')
+      }
+
+      // Fallback: if no tools were specified but install is requested
+      if (allTools.length === 0 && core.getInput('install_args')) {
+        core.info(
+          'No tools found in configuration, falling back to install_args'
+        )
+        await installAllConfiguredTools()
+      }
+
+      // Save cache for newly installed tools
+      if (core.getBooleanInput('cache') && installedTools.length > 0) {
+        await saveAllCaches(cacheResult, installedTools)
       }
     }
 
-    // List installed tools
+    // Final reshim after installing new tools
+    if (core.getBooleanInput('reshim') && installedTools.length > 0) {
+      await reshimTools()
+    }
+
+    // List installed tools for verification
     await listTools()
+
+    // Log final summary
+    logExecutionSummary(cacheResult, installedTools.length)
   } catch (err) {
     if (err instanceof Error) {
       core.setFailed(err.message)
@@ -89,4 +142,29 @@ function parseConfiguration(): MiseConfig {
 async function setupConfigurationFiles(config: MiseConfig): Promise<void> {
   await setupToolVersions(config)
   await setupMiseToml(config)
+}
+
+/**
+ * Log execution summary
+ */
+function logExecutionSummary(
+  cacheResult: CacheResult,
+  installedCount: number
+): void {
+  core.info('\n🎉 Mise Action Execution Summary:')
+  core.info(`  📦 Total tools managed: ${cacheResult.totalTools}`)
+  core.info(`  ♻️  Tools restored from cache: ${cacheResult.cachedTools}`)
+  core.info(`  ⬇️  Tools installed: ${installedCount}`)
+  core.info(
+    `  🚀 Cache efficiency: ${cacheResult.totalTools > 0 ? ((cacheResult.cachedTools / cacheResult.totalTools) * 100).toFixed(1) : 0}%`
+  )
+
+  if (cacheResult.totalTools > 0) {
+    const timesSaved = cacheResult.cachedTools
+    if (timesSaved > 0) {
+      core.info(
+        `  ⏱️  Estimated time saved: ~${timesSaved * 30}s (assuming 30s per tool)`
+      )
+    }
+  }
 }

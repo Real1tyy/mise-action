@@ -4,7 +4,7 @@ import * as io from '@actions/io'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { MiseConfig } from './types'
+import { MiseConfig, Tool } from './types'
 import {
   miseDir,
   getSystemInfo,
@@ -188,11 +188,66 @@ export async function testMise(): Promise<number> {
 }
 
 /**
- * Install tools using mise
+ * Install all tools using mise install
+ * @deprecated Use installSpecificTools for selective installation
  */
 export async function installTools(installArgs?: string): Promise<number> {
   const args = installArgs ? `install ${installArgs}` : 'install'
   return executeMiseCommand([args])
+}
+
+/**
+ * Install only specific tools that weren't restored from cache
+ */
+export async function installSpecificTools(tools: Tool[]): Promise<Tool[]> {
+  if (tools.length === 0) {
+    core.info('No tools to install')
+    return []
+  }
+
+  core.startGroup(`Installing ${tools.length} tools`)
+
+  const installedTools: Tool[] = []
+
+  try {
+    // Install tools one by one for better error handling and caching
+    for (const tool of tools) {
+      try {
+        core.info(`Installing ${tool.name}@${tool.version}...`)
+        const result = await executeMiseCommand([
+          'install',
+          `${tool.name}@${tool.version}`
+        ])
+
+        if (result === 0) {
+          core.info(`✓ Successfully installed ${tool.name}@${tool.version}`)
+          installedTools.push(tool)
+        } else {
+          core.warning(`Failed to install ${tool.name}@${tool.version}`)
+        }
+      } catch (error) {
+        core.warning(`Error installing ${tool.name}@${tool.version}: ${error}`)
+      }
+    }
+
+    core.info(
+      `Successfully installed ${installedTools.length}/${tools.length} tools`
+    )
+  } catch (error) {
+    core.error(`Failed to install tools: ${error}`)
+  } finally {
+    core.endGroup()
+  }
+
+  return installedTools
+}
+
+/**
+ * Install all tools from configuration (fallback method)
+ */
+export async function installAllConfiguredTools(): Promise<number> {
+  core.info('Installing all tools from configuration...')
+  return executeMiseCommand(['install'])
 }
 
 /**
@@ -207,4 +262,13 @@ export async function listTools(): Promise<number> {
  */
 export async function reshimTools(): Promise<number> {
   return executeMiseCommand(['reshim', '--all'])
+}
+
+/**
+ * Trust the current directory for mise configuration
+ */
+export async function trustCurrentDirectory(): Promise<number> {
+  const cwd = getWorkingDirectory()
+  core.info(`Trusting directory: ${cwd}`)
+  return executeMiseCommand(['trust', cwd])
 }
