@@ -66486,7 +66486,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 9407:
+/***/ 7377:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 "use strict";
@@ -66525,81 +66525,86 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.restoreMiseCache = restoreMiseCache;
+exports.saveMiseCache = saveMiseCache;
 const cache = __importStar(__nccwpck_require__(5116));
-const io = __importStar(__nccwpck_require__(4994));
 const core = __importStar(__nccwpck_require__(7484));
-const exec = __importStar(__nccwpck_require__(5236));
 const glob = __importStar(__nccwpck_require__(7206));
 const crypto = __importStar(__nccwpck_require__(6982));
 const fs = __importStar(__nccwpck_require__(9896));
-const os = __importStar(__nccwpck_require__(857));
-const path = __importStar(__nccwpck_require__(6928));
-async function run() {
-    try {
-        await setToolVersions();
-        await setMiseToml();
-        let cacheKey;
-        if (core.getBooleanInput('cache')) {
-            cacheKey = await restoreMiseCache();
-        }
-        else {
-            core.setOutput('cache-hit', false);
-        }
-        const version = core.getInput('version');
-        await setupMise(version);
-        await setEnvVars();
-        if (core.getBooleanInput('reshim')) {
-            await miseReshim();
-        }
-        await testMise();
-        if (core.getBooleanInput('install')) {
-            await miseInstall();
-            if (cacheKey && core.getBooleanInput('cache_save')) {
-                await saveCache(cacheKey);
-            }
-        }
-        await miseLs();
-    }
-    catch (err) {
-        if (err instanceof Error)
-            core.setFailed(err.message);
-        else
-            throw err;
-    }
-}
-async function setEnvVars() {
-    core.startGroup('Setting env vars');
-    const set = (k, v) => {
-        if (!process.env[k]) {
-            core.info(`Setting ${k}=${v}`);
-            core.exportVariable(k, v);
-        }
-    };
-    if (core.getBooleanInput('experimental'))
-        set('MISE_EXPERIMENTAL', '1');
-    const logLevel = core.getInput('log_level');
-    if (logLevel)
-        set('MISE_LOG_LEVEL', logLevel);
-    const githubToken = core.getInput('github_token');
-    if (githubToken) {
-        set('GITHUB_TOKEN', githubToken);
-    }
-    else {
-        core.warning('No GITHUB_TOKEN provided. You may hit GitHub API rate limits when installing tools from GitHub.');
-    }
-    set('MISE_TRUSTED_CONFIG_PATHS', process.cwd());
-    set('MISE_YES', '1');
-    const shimsDir = path.join(miseDir(), 'shims');
-    core.info(`Adding ${shimsDir} to PATH`);
-    core.addPath(shimsDir);
-}
+const utils_1 = __nccwpck_require__(1798);
+/**
+ * Restore mise cache based on configuration files
+ */
 async function restoreMiseCache() {
     core.startGroup('Restoring mise cache');
-    const version = core.getInput('version');
-    const installArgs = core.getInput('install_args');
-    const { MISE_ENV } = process.env;
-    const cachePath = miseDir();
-    const fileHash = await glob.hashFiles([
+    try {
+        const version = core.getInput('version');
+        const installArgs = core.getInput('install_args');
+        const { MISE_ENV } = process.env;
+        const cachePath = (0, utils_1.miseDir)();
+        const fileHash = await generateConfigHash();
+        const systemInfo = await (0, utils_1.getSystemInfo)();
+        const prefix = core.getInput('cache_key_prefix') || 'mise-v0';
+        let primaryKey = `${prefix}-${systemInfo.target}-${fileHash}`;
+        if (version) {
+            primaryKey = `${primaryKey}-${version}`;
+        }
+        if (MISE_ENV) {
+            primaryKey = `${primaryKey}-${MISE_ENV}`;
+        }
+        if (installArgs) {
+            const toolsHash = generateToolsHash(installArgs);
+            primaryKey = `${primaryKey}-${toolsHash}`;
+        }
+        // Save state for later use
+        core.saveState('PRIMARY_KEY', primaryKey);
+        core.saveState('MISE_DIR', cachePath);
+        const cacheKey = await cache.restoreCache([cachePath], primaryKey);
+        core.setOutput('cache-hit', Boolean(cacheKey));
+        if (!cacheKey) {
+            core.info(`mise cache not found for ${primaryKey}`);
+            return primaryKey;
+        }
+        core.info(`mise cache restored from key: ${cacheKey}`);
+        return cacheKey;
+    }
+    catch (error) {
+        core.warning(`Failed to restore mise cache: ${error}`);
+        core.setOutput('cache-hit', false);
+        return undefined;
+    }
+    finally {
+        core.endGroup();
+    }
+}
+/**
+ * Save mise cache
+ */
+async function saveMiseCache(cacheKey) {
+    return core.group('Saving mise cache', async () => {
+        const cachePath = (0, utils_1.miseDir)();
+        if (!fs.existsSync(cachePath)) {
+            throw new Error(`Cache folder path does not exist on disk: ${cachePath}`);
+        }
+        try {
+            const cacheId = await cache.saveCache([cachePath], cacheKey);
+            if (cacheId === -1) {
+                core.info('Cache not saved (already exists)');
+                return;
+            }
+            core.info(`Cache saved from ${cachePath} with key: ${cacheKey}`);
+        }
+        catch (error) {
+            core.warning(`Failed to save mise cache: ${error}`);
+        }
+    });
+}
+/**
+ * Generate hash from configuration files
+ */
+async function generateConfigHash() {
+    const configPatterns = [
         `**/.config/mise/config.toml`,
         `**/.config/mise/config.lock`,
         `**/.config/mise/config.*.toml`,
@@ -66625,132 +66630,490 @@ async function restoreMiseCache() {
         `**/mise.*.toml`,
         `**/mise.*.lock`,
         `**/.tool-versions`
-    ].join('\n'));
-    const prefix = core.getInput('cache_key_prefix') || 'mise-v0';
-    let primaryKey = `${prefix}-${await getTarget()}-${fileHash}`;
-    if (version) {
-        primaryKey = `${primaryKey}-${version}`;
+    ];
+    return await glob.hashFiles(configPatterns.join('\n'));
+}
+/**
+ * Generate hash from tools in install arguments
+ */
+function generateToolsHash(installArgs) {
+    const tools = installArgs
+        .split(' ')
+        .filter((arg) => !arg.startsWith('-'))
+        .sort()
+        .join(' ');
+    if (!tools)
+        return '';
+    return crypto.createHash('sha256').update(tools).digest('hex');
+}
+
+
+/***/ }),
+
+/***/ 2678:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
     }
-    if (MISE_ENV) {
-        primaryKey = `${primaryKey}-${MISE_ENV}`;
-    }
-    if (installArgs) {
-        const tools = installArgs
-            .split(' ')
-            .filter(arg => !arg.startsWith('-'))
-            .sort()
-            .join(' ');
-        if (tools) {
-            const toolsHash = crypto.createHash('sha256').update(tools).digest('hex');
-            primaryKey = `${primaryKey}-${toolsHash}`;
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.setupEnvironmentVariables = setupEnvironmentVariables;
+const core = __importStar(__nccwpck_require__(7484));
+const path = __importStar(__nccwpck_require__(6928));
+const utils_1 = __nccwpck_require__(1798);
+/**
+ * Set up all mise-related environment variables
+ */
+async function setupEnvironmentVariables(config) {
+    core.startGroup('Setting env vars');
+    const set = (key, value) => {
+        if (!process.env[key]) {
+            core.info(`Setting ${key}=${value}`);
+            core.exportVariable(key, value);
         }
+    };
+    // Set experimental flag if enabled
+    if (config.experimental) {
+        set('MISE_EXPERIMENTAL', '1');
     }
-    core.saveState('PRIMARY_KEY', primaryKey);
-    core.saveState('MISE_DIR', cachePath);
-    const cacheKey = await cache.restoreCache([cachePath], primaryKey);
-    core.setOutput('cache-hit', Boolean(cacheKey));
-    if (!cacheKey) {
-        core.info(`mise cache not found for ${primaryKey}`);
-        return primaryKey;
+    // Set log level if provided
+    if (config.logLevel) {
+        set('MISE_LOG_LEVEL', config.logLevel);
     }
-    core.info(`mise cache restored from key: ${cacheKey}`);
-}
-async function setupMise(version) {
-    const miseBinDir = path.join(miseDir(), 'bin');
-    const miseBinPath = path.join(miseBinDir, process.platform === 'win32' ? 'mise.exe' : 'mise');
-    if (!fs.existsSync(path.join(miseBinPath))) {
-        core.startGroup(version ? `Download mise@${version}` : 'Setup mise');
-        await fs.promises.mkdir(miseBinDir, { recursive: true });
-        const ext = process.platform === 'win32'
-            ? '.zip'
-            : version && version.startsWith('2024')
-                ? ''
-                : (await zstdInstalled())
-                    ? '.tar.zst'
-                    : '.tar.gz';
-        version = (version || (await latestMiseVersion())).replace(/^v/, '');
-        const url = `https://github.com/jdx/mise/releases/download/v${version}/mise-v${version}-${await getTarget()}${ext}`;
-        const archivePath = path.join(os.tmpdir(), `mise${ext}`);
-        switch (ext) {
-            case '.zip':
-                await exec.exec('curl', ['-fsSL', url, '--output', archivePath]);
-                await exec.exec('unzip', [archivePath, '-d', os.tmpdir()]);
-                await io.mv(path.join(os.tmpdir(), 'mise/bin/mise.exe'), miseBinPath);
-                break;
-            case '.tar.zst':
-                await exec.exec('sh', [
-                    '-c',
-                    `curl -fsSL ${url} | tar --zstd -xf - -C ${os.tmpdir()} && mv ${os.tmpdir()}/mise/bin/mise ${miseBinPath}`
-                ]);
-                break;
-            case '.tar.gz':
-                await exec.exec('sh', [
-                    '-c',
-                    `curl -fsSL ${url} | tar -xzf - -C ${os.tmpdir()} && mv ${os.tmpdir()}/mise/bin/mise ${miseBinPath}`
-                ]);
-                break;
-            default:
-                await exec.exec('sh', ['-c', `curl -fsSL ${url} > ${miseBinPath}`]);
-                await exec.exec('chmod', ['+x', miseBinPath]);
-                break;
-        }
-    }
-    core.addPath(miseBinDir);
-}
-async function zstdInstalled() {
-    try {
-        await exec.exec('zstd', ['--version']);
-        return true;
-    }
-    catch {
-        return false;
-    }
-}
-async function latestMiseVersion() {
-    const rsp = await exec.getExecOutput('curl', [
-        '-fsSL',
-        'https://mise.jdx.dev/VERSION'
-    ]);
-    return rsp.stdout.trim();
-}
-async function setToolVersions() {
-    const toolVersions = core.getInput('tool_versions');
-    if (toolVersions) {
-        await writeFile('.tool-versions', toolVersions);
-    }
-}
-async function setMiseToml() {
-    const toml = core.getInput('mise_toml');
-    if (toml) {
-        await writeFile('mise.toml', toml);
-    }
-}
-const testMise = async () => mise(['--version']);
-const miseInstall = async () => mise([`install ${core.getInput('install_args')}`]);
-const miseLs = async () => mise([`ls`]);
-const miseReshim = async () => mise([`reshim`, `--all`]);
-const mise = async (args) => core.group(`Running mise ${args.join(' ')}`, async () => {
-    const cwd = core.getInput('working_directory') ||
-        core.getInput('install_dir') ||
-        process.cwd();
-    const env = core.isDebug()
-        ? { ...process.env, MISE_LOG_LEVEL: 'debug' }
-        : undefined;
-    if (args.length === 1) {
-        return exec.exec(`mise ${args}`, [], {
-            cwd,
-            env
-        });
+    // Set GitHub token if provided
+    if (config.githubToken) {
+        set('GITHUB_TOKEN', config.githubToken);
     }
     else {
-        return exec.exec('mise', args, { cwd, env });
+        core.warning('No GITHUB_TOKEN provided. You may hit GitHub API rate limits when installing tools from GitHub.');
     }
+    // Set mise-specific environment variables
+    set('MISE_TRUSTED_CONFIG_PATHS', process.cwd());
+    set('MISE_YES', '1');
+    // Add shims directory to PATH
+    const shimsDir = path.join((0, utils_1.miseDir)(), 'shims');
+    core.info(`Adding ${shimsDir} to PATH`);
+    core.addPath(shimsDir);
+    core.endGroup();
+}
+
+
+/***/ }),
+
+/***/ 1730:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
 });
-const writeFile = async (p, body) => core.group(`Writing ${p}`, async () => {
-    core.info(`Body:\n${body}`);
-    await fs.promises.writeFile(p, body, { encoding: 'utf8' });
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.run = run;
+const core = __importStar(__nccwpck_require__(7484));
+const environment_1 = __nccwpck_require__(2678);
+const setup_1 = __nccwpck_require__(8294);
+const cache_1 = __nccwpck_require__(7377);
+/**
+ * Main entry point for the mise action
+ */
+async function run() {
+    try {
+        // Parse configuration from inputs
+        const config = parseConfiguration();
+        // Set up configuration files
+        await setupConfigurationFiles(config);
+        // Handle caching
+        let cacheKey;
+        if (core.getBooleanInput('cache')) {
+            cacheKey = await (0, cache_1.restoreMiseCache)();
+        }
+        else {
+            core.setOutput('cache-hit', false);
+        }
+        // Set up mise binary
+        await (0, setup_1.setupMise)(config.version);
+        // Set up environment variables
+        await (0, environment_1.setupEnvironmentVariables)(config);
+        // Reshim if requested
+        if (core.getBooleanInput('reshim')) {
+            await (0, setup_1.reshimTools)();
+        }
+        // Test mise installation
+        await (0, setup_1.testMise)();
+        // Install tools if requested
+        if (core.getBooleanInput('install')) {
+            await (0, setup_1.installTools)(config.installArgs);
+            // Save cache if enabled and we have a cache key
+            if (cacheKey && core.getBooleanInput('cache_save')) {
+                await (0, cache_1.saveMiseCache)(cacheKey);
+            }
+        }
+        // List installed tools
+        await (0, setup_1.listTools)();
+    }
+    catch (err) {
+        if (err instanceof Error) {
+            core.setFailed(err.message);
+        }
+        else {
+            throw err;
+        }
+    }
+}
+/**
+ * Parse configuration from GitHub Actions inputs
+ */
+function parseConfiguration() {
+    return {
+        version: core.getInput('version') || undefined,
+        experimental: core.getBooleanInput('experimental'),
+        logLevel: core.getInput('log_level') || undefined,
+        githubToken: core.getInput('github_token') || undefined,
+        workingDirectory: core.getInput('working_directory') || undefined,
+        installDir: core.getInput('install_dir') || undefined,
+        installArgs: core.getInput('install_args') || undefined,
+        toolVersions: core.getInput('tool_versions') || undefined,
+        miseToml: core.getInput('mise_toml') || undefined
+    };
+}
+/**
+ * Set up configuration files (.tool-versions and mise.toml)
+ */
+async function setupConfigurationFiles(config) {
+    await (0, setup_1.setupToolVersions)(config);
+    await (0, setup_1.setupMiseToml)(config);
+}
+
+
+/***/ }),
+
+/***/ 8294:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
 });
-run();
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.setupMise = setupMise;
+exports.setupToolVersions = setupToolVersions;
+exports.setupMiseToml = setupMiseToml;
+exports.executeMiseCommand = executeMiseCommand;
+exports.testMise = testMise;
+exports.installTools = installTools;
+exports.listTools = listTools;
+exports.reshimTools = reshimTools;
+const core = __importStar(__nccwpck_require__(7484));
+const exec = __importStar(__nccwpck_require__(5236));
+const io = __importStar(__nccwpck_require__(4994));
+const fs = __importStar(__nccwpck_require__(9896));
+const os = __importStar(__nccwpck_require__(857));
+const path = __importStar(__nccwpck_require__(6928));
+const utils_1 = __nccwpck_require__(1798);
+/**
+ * Install mise binary if not already present
+ */
+async function setupMise(version) {
+    const miseBinDir = path.join((0, utils_1.miseDir)(), 'bin');
+    const miseBinPath = path.join(miseBinDir, process.platform === 'win32' ? 'mise.exe' : 'mise');
+    if (fs.existsSync(miseBinPath)) {
+        core.info('mise binary already exists, skipping installation');
+        core.addPath(miseBinDir);
+        return;
+    }
+    core.startGroup(version ? `Download mise@${version}` : 'Setup mise');
+    try {
+        await fs.promises.mkdir(miseBinDir, { recursive: true });
+        await downloadAndInstallMise(version, miseBinPath);
+        core.addPath(miseBinDir);
+        core.info('mise installation completed successfully');
+    }
+    catch (error) {
+        throw new Error(`Failed to setup mise: ${error}`);
+    }
+    finally {
+        core.endGroup();
+    }
+}
+/**
+ * Download and install mise binary
+ */
+async function downloadAndInstallMise(version, miseBinPath) {
+    const systemInfo = await (0, utils_1.getSystemInfo)();
+    const resolvedVersion = (version || (await (0, utils_1.latestMiseVersion)())).replace(/^v/, '');
+    const ext = await getArchiveExtension(resolvedVersion);
+    const url = `https://github.com/jdx/mise/releases/download/v${resolvedVersion}/mise-v${resolvedVersion}-${systemInfo.target}${ext}`;
+    const archivePath = path.join(os.tmpdir(), `mise${ext}`);
+    core.info(`Downloading mise from: ${url}`);
+    switch (ext) {
+        case '.zip':
+            await downloadAndExtractZip(url, archivePath, miseBinPath);
+            break;
+        case '.tar.zst':
+            await downloadAndExtractTarZst(url, miseBinPath);
+            break;
+        case '.tar.gz':
+            await downloadAndExtractTarGz(url, miseBinPath);
+            break;
+        default:
+            await downloadRawBinary(url, miseBinPath);
+            break;
+    }
+}
+/**
+ * Determine the appropriate archive extension
+ */
+async function getArchiveExtension(version) {
+    if (process.platform === 'win32') {
+        return '.zip';
+    }
+    if (version.startsWith('2024')) {
+        return '';
+    }
+    return (await (0, utils_1.zstdInstalled)()) ? '.tar.zst' : '.tar.gz';
+}
+/**
+ * Download and extract ZIP archive
+ */
+async function downloadAndExtractZip(url, archivePath, miseBinPath) {
+    await exec.exec('curl', ['-fsSL', url, '--output', archivePath]);
+    await exec.exec('unzip', [archivePath, '-d', os.tmpdir()]);
+    await io.mv(path.join(os.tmpdir(), 'mise/bin/mise.exe'), miseBinPath);
+}
+/**
+ * Download and extract tar.zst archive
+ */
+async function downloadAndExtractTarZst(url, miseBinPath) {
+    await exec.exec('sh', [
+        '-c',
+        `curl -fsSL ${url} | tar --zstd -xf - -C ${os.tmpdir()} && mv ${os.tmpdir()}/mise/bin/mise ${miseBinPath}`
+    ]);
+}
+/**
+ * Download and extract tar.gz archive
+ */
+async function downloadAndExtractTarGz(url, miseBinPath) {
+    await exec.exec('sh', [
+        '-c',
+        `curl -fsSL ${url} | tar -xzf - -C ${os.tmpdir()} && mv ${os.tmpdir()}/mise/bin/mise ${miseBinPath}`
+    ]);
+}
+/**
+ * Download raw binary
+ */
+async function downloadRawBinary(url, miseBinPath) {
+    await exec.exec('sh', ['-c', `curl -fsSL ${url} > ${miseBinPath}`]);
+    await exec.exec('chmod', ['+x', miseBinPath]);
+}
+/**
+ * Set up tool versions file if provided
+ */
+async function setupToolVersions(config) {
+    if (config.toolVersions) {
+        await (0, utils_1.writeFile)('.tool-versions', config.toolVersions);
+    }
+}
+/**
+ * Set up mise.toml file if provided
+ */
+async function setupMiseToml(config) {
+    if (config.miseToml) {
+        await (0, utils_1.writeFile)('mise.toml', config.miseToml);
+    }
+}
+/**
+ * Execute a mise command
+ */
+async function executeMiseCommand(args) {
+    return core.group(`Running mise ${args.join(' ')}`, async () => {
+        const cwd = (0, utils_1.getWorkingDirectory)();
+        const env = core.isDebug()
+            ? { ...process.env, MISE_LOG_LEVEL: 'debug' }
+            : undefined;
+        if (args.length === 1) {
+            return exec.exec(`mise ${args[0]}`, [], { cwd, env });
+        }
+        else {
+            return exec.exec('mise', args, { cwd, env });
+        }
+    });
+}
+/**
+ * Test mise installation
+ */
+async function testMise() {
+    return executeMiseCommand(['--version']);
+}
+/**
+ * Install tools using mise
+ */
+async function installTools(installArgs) {
+    const args = installArgs ? `install ${installArgs}` : 'install';
+    return executeMiseCommand([args]);
+}
+/**
+ * List installed tools
+ */
+async function listTools() {
+    return executeMiseCommand(['ls']);
+}
+/**
+ * Reshim all tools
+ */
+async function reshimTools() {
+    return executeMiseCommand(['reshim', '--all']);
+}
+
+
+/***/ }),
+
+/***/ 1798:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.miseDir = miseDir;
+exports.getSystemInfo = getSystemInfo;
+exports.zstdInstalled = zstdInstalled;
+exports.latestMiseVersion = latestMiseVersion;
+exports.writeFile = writeFile;
+exports.getWorkingDirectory = getWorkingDirectory;
+const core = __importStar(__nccwpck_require__(7484));
+const exec = __importStar(__nccwpck_require__(5236));
+const fs = __importStar(__nccwpck_require__(9896));
+const os = __importStar(__nccwpck_require__(857));
+const path = __importStar(__nccwpck_require__(6928));
+/**
+ * Get the mise data directory path
+ */
 function miseDir() {
     const dir = core.getState('MISE_DIR');
     if (dir)
@@ -66764,41 +67127,90 @@ function miseDir() {
         return path.join(LOCALAPPDATA, 'mise');
     return path.join(os.homedir(), '.local', 'share', 'mise');
 }
-async function saveCache(cacheKey) {
-    core.group(`Saving mise cache`, async () => {
-        const cachePath = miseDir();
-        if (!fs.existsSync(cachePath)) {
-            throw new Error(`Cache folder path does not exist on disk: ${cachePath}`);
-        }
-        const cacheId = await cache.saveCache([cachePath], cacheKey);
-        if (cacheId === -1)
-            return;
-        core.info(`Cache saved from ${cachePath} with key: ${cacheKey}`);
-    });
-}
-async function getTarget() {
+/**
+ * Get system target information for binary downloads
+ */
+async function getSystemInfo() {
     let { arch } = process;
     // quick overwrite to abide by release format
     if (arch === 'arm')
         arch = 'armv7';
+    const isMusl = await checkIsMusl();
+    let target;
     switch (process.platform) {
         case 'darwin':
-            return `macos-${arch}`;
+            target = `macos-${arch}`;
+            break;
         case 'win32':
-            return `windows-${arch}`;
+            target = `windows-${arch}`;
+            break;
         case 'linux':
-            return `linux-${arch}${(await isMusl()) ? '-musl' : ''}`;
+            target = `linux-${arch}${isMusl ? '-musl' : ''}`;
+            break;
         default:
             throw new Error(`Unsupported platform ${process.platform}`);
     }
+    return {
+        platform: process.platform,
+        arch,
+        target,
+        isMusl
+    };
 }
-async function isMusl() {
-    // `ldd --version` always returns 1 and print to stderr
-    const { stderr } = await exec.getExecOutput('ldd', ['--version'], {
-        failOnStdErr: false,
-        ignoreReturnCode: true
+/**
+ * Check if system uses musl libc
+ */
+async function checkIsMusl() {
+    try {
+        // `ldd --version` always returns 1 and print to stderr
+        const { stderr } = await exec.getExecOutput('ldd', ['--version'], {
+            failOnStdErr: false,
+            ignoreReturnCode: true
+        });
+        return stderr.indexOf('musl') > -1;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Check if zstd is installed on the system
+ */
+async function zstdInstalled() {
+    try {
+        await exec.exec('zstd', ['--version']);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Get the latest mise version from the release endpoint
+ */
+async function latestMiseVersion() {
+    const rsp = await exec.getExecOutput('curl', [
+        '-fsSL',
+        'https://mise.jdx.dev/VERSION'
+    ]);
+    return rsp.stdout.trim();
+}
+/**
+ * Write content to a file with logging
+ */
+async function writeFile(filePath, body) {
+    return core.group(`Writing ${filePath}`, async () => {
+        core.info(`Body:\n${body}`);
+        await fs.promises.writeFile(filePath, body, { encoding: 'utf8' });
     });
-    return stderr.indexOf('musl') > -1;
+}
+/**
+ * Get current working directory based on inputs
+ */
+function getWorkingDirectory() {
+    return (core.getInput('working_directory') ||
+        core.getInput('install_dir') ||
+        process.cwd());
 }
 
 
@@ -80293,13 +80705,20 @@ module.exports = /*#__PURE__*/JSON.parse('{"name":"@actions/cache","version":"4.
 /******/ 	if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = __dirname + "/";
 /******/ 	
 /************************************************************************/
-/******/ 	
-/******/ 	// startup
-/******/ 	// Load entry module and return exports
-/******/ 	// This entry module is referenced by other modules so it can't be inlined
-/******/ 	var __webpack_exports__ = __nccwpck_require__(9407);
-/******/ 	module.exports = __webpack_exports__;
-/******/ 	
+var __webpack_exports__ = {};
+// This entry need to be wrapped in an IIFE because it need to be in strict mode.
+(() => {
+"use strict";
+var exports = __webpack_exports__;
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+const main_1 = __nccwpck_require__(1730);
+// Execute the main function
+(0, main_1.run)();
+
+})();
+
+module.exports = __webpack_exports__;
 /******/ })()
 ;
 //# sourceMappingURL=index.js.map
