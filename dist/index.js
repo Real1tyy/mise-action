@@ -66486,7 +66486,7 @@ module.exports = {
 
 /***/ }),
 
-/***/ 9407:
+/***/ 7377:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 "use strict";
@@ -66525,232 +66525,1092 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.restoreAllCaches = restoreAllCaches;
+exports.saveAllCaches = saveAllCaches;
 const cache = __importStar(__nccwpck_require__(5116));
-const io = __importStar(__nccwpck_require__(4994));
 const core = __importStar(__nccwpck_require__(7484));
-const exec = __importStar(__nccwpck_require__(5236));
-const glob = __importStar(__nccwpck_require__(7206));
-const crypto = __importStar(__nccwpck_require__(6982));
 const fs = __importStar(__nccwpck_require__(9896));
-const os = __importStar(__nccwpck_require__(857));
 const path = __importStar(__nccwpck_require__(6928));
-async function run() {
+const utils_1 = __nccwpck_require__(1798);
+const tools_1 = __nccwpck_require__(1732);
+/**
+ * Restore both global mise cache and individual tool caches
+ */
+async function restoreAllCaches(tools) {
+    core.startGroup('Restoring caches');
     try {
-        await setToolVersions();
-        await setMiseToml();
-        let cacheKey;
-        if (core.getBooleanInput('cache')) {
-            cacheKey = await restoreMiseCache();
-        }
-        else {
-            core.setOutput('cache-hit', false);
-        }
-        const version = core.getInput('version');
-        await setupMise(version);
-        await setEnvVars();
-        if (core.getBooleanInput('reshim')) {
-            await miseReshim();
-        }
-        await testMise();
-        if (core.getBooleanInput('install')) {
-            await miseInstall();
-            if (cacheKey && core.getBooleanInput('cache_save')) {
-                await saveCache(cacheKey);
-            }
-        }
-        await miseLs();
+        const systemInfo = await (0, utils_1.getSystemInfo)();
+        const version = core.getInput('version') || 'latest';
+        const keyPrefix = core.getInput('cache_key_prefix') || 'mise-v1';
+        // Restore global mise cache
+        const globalCacheHit = await restoreGlobalMiseCache(systemInfo.target, version, keyPrefix);
+        // Restore individual tool caches
+        const toolCacheResults = await restoreToolCaches(tools, systemInfo.target, keyPrefix);
+        const cachedTools = toolCacheResults.filter(t => t.isRestored).length;
+        const missingTools = toolCacheResults
+            .filter(t => !t.isRestored)
+            .map(t => t.tool);
+        const result = {
+            globalCacheHit,
+            toolCacheResults,
+            totalTools: tools.length,
+            cachedTools,
+            missingTools
+        };
+        // Set outputs for GitHub Actions
+        setOutputs(result);
+        logCacheResults(result);
+        return result;
     }
-    catch (err) {
-        if (err instanceof Error)
-            core.setFailed(err.message);
-        else
-            throw err;
+    catch (error) {
+        core.warning(`Failed to restore caches: ${error}`);
+        return {
+            globalCacheHit: false,
+            toolCacheResults: tools.map(tool => ({
+                tool,
+                cacheKey: '',
+                cachePath: '',
+                isRestored: false
+            })),
+            totalTools: tools.length,
+            cachedTools: 0,
+            missingTools: tools
+        };
+    }
+    finally {
+        core.endGroup();
     }
 }
-async function setEnvVars() {
+/**
+ * Restore global mise binary cache
+ */
+async function restoreGlobalMiseCache(target, version, keyPrefix) {
+    const globalCacheKey = `${keyPrefix}-${target}-${version}-global`;
+    const miseCachePath = path.join((0, utils_1.miseDir)(), 'bin');
+    core.info(`Checking global mise cache: ${globalCacheKey}`);
+    try {
+        const cacheKey = await cache.restoreCache([miseCachePath], globalCacheKey);
+        const hit = Boolean(cacheKey);
+        if (hit) {
+            core.info(`✓ Global mise cache restored: ${cacheKey}`);
+        }
+        else {
+            core.info(`✗ Global mise cache not found`);
+        }
+        return hit;
+    }
+    catch (error) {
+        core.warning(`Failed to restore global mise cache: ${error}`);
+        return false;
+    }
+}
+/**
+ * Restore individual tool caches
+ */
+async function restoreToolCaches(tools, target, keyPrefix) {
+    const results = await Promise.all(tools.map(async (tool) => {
+        const toolHash = (0, tools_1.generateToolHash)(tool);
+        const toolCacheKey = `${keyPrefix}-${target}-tool-${toolHash}`;
+        const toolCachePath = path.join((0, utils_1.miseDir)(), 'installs', tool.name, tool.version);
+        core.info(`Checking tool cache: ${tool.name}@${tool.version}`);
+        try {
+            const cacheKey = await cache.restoreCache([toolCachePath], toolCacheKey);
+            const isRestored = Boolean(cacheKey);
+            if (isRestored) {
+                core.info(`  ✓ Restored from cache: ${cacheKey}`);
+            }
+            else {
+                core.info(`  ✗ Not found in cache`);
+            }
+            return {
+                tool,
+                cacheKey: toolCacheKey,
+                cachePath: toolCachePath,
+                isRestored
+            };
+        }
+        catch (error) {
+            core.warning(`Failed to restore cache for ${tool.name}: ${error}`);
+            return {
+                tool,
+                cacheKey: toolCacheKey,
+                cachePath: toolCachePath,
+                isRestored: false
+            };
+        }
+    }));
+    return results;
+}
+/**
+ * Save caches for newly installed tools and global mise
+ */
+async function saveAllCaches(cacheResult, installedTools) {
+    if (!core.getBooleanInput('cache_save')) {
+        core.info('Cache saving disabled, skipping...');
+        return;
+    }
+    core.startGroup('Saving caches');
+    try {
+        // Save global mise cache if it wasn't restored
+        if (!cacheResult.globalCacheHit) {
+            await saveGlobalMiseCache();
+        }
+        // Save caches for newly installed tools
+        const savePromises = installedTools.map(async (tool) => {
+            const toolCacheInfo = cacheResult.toolCacheResults.find(t => t.tool.name === tool.name && t.tool.version === tool.version);
+            if (toolCacheInfo && !toolCacheInfo.isRestored) {
+                await saveToolCache(toolCacheInfo);
+            }
+        });
+        await Promise.all(savePromises);
+    }
+    catch (error) {
+        core.warning(`Failed to save caches: ${error}`);
+    }
+    finally {
+        core.endGroup();
+    }
+}
+/**
+ * Save global mise binary cache
+ */
+async function saveGlobalMiseCache() {
+    const systemInfo = await (0, utils_1.getSystemInfo)();
+    const version = core.getInput('version') || 'latest';
+    const keyPrefix = core.getInput('cache_key_prefix') || 'mise-v1';
+    const globalCacheKey = `${keyPrefix}-${systemInfo.target}-${version}-global`;
+    const miseCachePath = path.join((0, utils_1.miseDir)(), 'bin');
+    if (!fs.existsSync(miseCachePath)) {
+        core.warning(`Global mise path does not exist: ${miseCachePath}`);
+        return;
+    }
+    try {
+        const cacheId = await cache.saveCache([miseCachePath], globalCacheKey);
+        if (cacheId !== -1) {
+            core.info(`✓ Global mise cache saved: ${globalCacheKey}`);
+        }
+        else {
+            core.info(`Global mise cache already exists: ${globalCacheKey}`);
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to save global mise cache: ${error}`);
+    }
+}
+/**
+ * Save individual tool cache
+ */
+async function saveToolCache(toolCacheInfo) {
+    const { tool, cacheKey, cachePath } = toolCacheInfo;
+    if (!fs.existsSync(cachePath)) {
+        core.warning(`Tool cache path does not exist for ${tool.name}@${tool.version}: ${cachePath}`);
+        return;
+    }
+    try {
+        const cacheId = await cache.saveCache([cachePath], cacheKey);
+        if (cacheId !== -1) {
+            core.info(`✓ Tool cache saved: ${tool.name}@${tool.version}`);
+        }
+        else {
+            core.info(`Tool cache already exists: ${tool.name}@${tool.version}`);
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to save tool cache for ${tool.name}: ${error}`);
+    }
+}
+/**
+ * Set GitHub Actions outputs based on cache results
+ */
+function setOutputs(result) {
+    const { totalTools, cachedTools, globalCacheHit } = result;
+    // Traditional cache-hit output (true only if ALL tools were cached)
+    const fullCacheHit = globalCacheHit && cachedTools === totalTools;
+    core.setOutput('cache-hit', fullCacheHit);
+    // New enhanced outputs
+    core.setOutput('global-cache-hit', globalCacheHit);
+    core.setOutput('partial-cache-hit', cachedTools > 0);
+    core.setOutput('tools-cache-hit-ratio', `${cachedTools}/${totalTools}`);
+    core.setOutput('cached-tools-count', cachedTools);
+    core.setOutput('missing-tools-count', totalTools - cachedTools);
+}
+/**
+ * Log detailed cache results
+ */
+function logCacheResults(result) {
+    const { totalTools, cachedTools, globalCacheHit, missingTools } = result;
+    core.info(`\n📊 Cache Results Summary:`);
+    core.info(`  Global mise cache: ${globalCacheHit ? '✓ Hit' : '✗ Miss'}`);
+    core.info(`  Tool caches: ${cachedTools}/${totalTools} restored`);
+    if (cachedTools > 0) {
+        core.info(`\n✅ Restored from cache:`);
+        result.toolCacheResults
+            .filter(t => t.isRestored)
+            .forEach(t => core.info(`  - ${t.tool.name}@${t.tool.version}`));
+    }
+    if (missingTools.length > 0) {
+        core.info(`\n⚠️  Need to install:`);
+        missingTools.forEach(tool => core.info(`  - ${tool.name}@${tool.version}`));
+    }
+    const cacheEfficiency = totalTools > 0 ? (cachedTools / totalTools) * 100 : 0;
+    core.info(`\n🎯 Cache efficiency: ${cacheEfficiency.toFixed(1)}%`);
+}
+
+
+/***/ }),
+
+/***/ 2678:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.setupEnvironmentVariables = setupEnvironmentVariables;
+const core = __importStar(__nccwpck_require__(7484));
+const path = __importStar(__nccwpck_require__(6928));
+const utils_1 = __nccwpck_require__(1798);
+/**
+ * Set up all mise-related environment variables
+ */
+async function setupEnvironmentVariables(config) {
     core.startGroup('Setting env vars');
-    const set = (k, v) => {
-        if (!process.env[k]) {
-            core.info(`Setting ${k}=${v}`);
-            core.exportVariable(k, v);
+    const set = (key, value) => {
+        if (!process.env[key]) {
+            core.info(`Setting ${key}=${value}`);
+            core.exportVariable(key, value);
         }
     };
-    if (core.getBooleanInput('experimental'))
+    // Set experimental flag if enabled
+    if (config.experimental) {
         set('MISE_EXPERIMENTAL', '1');
-    const logLevel = core.getInput('log_level');
-    if (logLevel)
-        set('MISE_LOG_LEVEL', logLevel);
-    const githubToken = core.getInput('github_token');
-    if (githubToken) {
-        set('GITHUB_TOKEN', githubToken);
+    }
+    // Set log level if provided
+    if (config.logLevel) {
+        set('MISE_LOG_LEVEL', config.logLevel);
+    }
+    // Set GitHub token if provided
+    if (config.githubToken) {
+        set('GITHUB_TOKEN', config.githubToken);
     }
     else {
         core.warning('No GITHUB_TOKEN provided. You may hit GitHub API rate limits when installing tools from GitHub.');
     }
+    // Set mise-specific environment variables
     set('MISE_TRUSTED_CONFIG_PATHS', process.cwd());
     set('MISE_YES', '1');
-    const shimsDir = path.join(miseDir(), 'shims');
+    // Add shims directory to PATH
+    const shimsDir = path.join((0, utils_1.miseDir)(), 'shims');
     core.info(`Adding ${shimsDir} to PATH`);
     core.addPath(shimsDir);
+    core.endGroup();
 }
-async function restoreMiseCache() {
-    core.startGroup('Restoring mise cache');
-    const version = core.getInput('version');
-    const installArgs = core.getInput('install_args');
-    const { MISE_ENV } = process.env;
-    const cachePath = miseDir();
-    const fileHash = await glob.hashFiles([
-        `**/.config/mise/config.toml`,
-        `**/.config/mise/config.lock`,
-        `**/.config/mise/config.*.toml`,
-        `**/.config/mise/config.*.lock`,
-        `**/.config/mise.toml`,
-        `**/.config/mise.lock`,
-        `**/.config/mise.*.toml`,
-        `**/.config/mise.*.lock`,
-        `**/.mise/config.toml`,
-        `**/.mise/config.lock`,
-        `**/.mise/config.*.toml`,
-        `**/.mise/config.*.lock`,
-        `**/mise/config.toml`,
-        `**/mise/config.lock`,
-        `**/mise/config.*.toml`,
-        `**/mise/config.*.lock`,
-        `**/.mise.toml`,
-        `**/.mise.lock`,
-        `**/.mise.*.toml`,
-        `**/.mise.*.lock`,
-        `**/mise.toml`,
-        `**/mise.lock`,
-        `**/mise.*.toml`,
-        `**/mise.*.lock`,
-        `**/.tool-versions`
-    ].join('\n'));
-    const prefix = core.getInput('cache_key_prefix') || 'mise-v0';
-    let primaryKey = `${prefix}-${await getTarget()}-${fileHash}`;
-    if (version) {
-        primaryKey = `${primaryKey}-${version}`;
+
+
+/***/ }),
+
+/***/ 1730:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
     }
-    if (MISE_ENV) {
-        primaryKey = `${primaryKey}-${MISE_ENV}`;
-    }
-    if (installArgs) {
-        const tools = installArgs
-            .split(' ')
-            .filter(arg => !arg.startsWith('-'))
-            .sort()
-            .join(' ');
-        if (tools) {
-            const toolsHash = crypto.createHash('sha256').update(tools).digest('hex');
-            primaryKey = `${primaryKey}-${toolsHash}`;
-        }
-    }
-    core.saveState('PRIMARY_KEY', primaryKey);
-    core.saveState('MISE_DIR', cachePath);
-    const cacheKey = await cache.restoreCache([cachePath], primaryKey);
-    core.setOutput('cache-hit', Boolean(cacheKey));
-    if (!cacheKey) {
-        core.info(`mise cache not found for ${primaryKey}`);
-        return primaryKey;
-    }
-    core.info(`mise cache restored from key: ${cacheKey}`);
-}
-async function setupMise(version) {
-    const miseBinDir = path.join(miseDir(), 'bin');
-    const miseBinPath = path.join(miseBinDir, process.platform === 'win32' ? 'mise.exe' : 'mise');
-    if (!fs.existsSync(path.join(miseBinPath))) {
-        core.startGroup(version ? `Download mise@${version}` : 'Setup mise');
-        await fs.promises.mkdir(miseBinDir, { recursive: true });
-        const ext = process.platform === 'win32'
-            ? '.zip'
-            : version && version.startsWith('2024')
-                ? ''
-                : (await zstdInstalled())
-                    ? '.tar.zst'
-                    : '.tar.gz';
-        version = (version || (await latestMiseVersion())).replace(/^v/, '');
-        const url = `https://github.com/jdx/mise/releases/download/v${version}/mise-v${version}-${await getTarget()}${ext}`;
-        const archivePath = path.join(os.tmpdir(), `mise${ext}`);
-        switch (ext) {
-            case '.zip':
-                await exec.exec('curl', ['-fsSL', url, '--output', archivePath]);
-                await exec.exec('unzip', [archivePath, '-d', os.tmpdir()]);
-                await io.mv(path.join(os.tmpdir(), 'mise/bin/mise.exe'), miseBinPath);
-                break;
-            case '.tar.zst':
-                await exec.exec('sh', [
-                    '-c',
-                    `curl -fsSL ${url} | tar --zstd -xf - -C ${os.tmpdir()} && mv ${os.tmpdir()}/mise/bin/mise ${miseBinPath}`
-                ]);
-                break;
-            case '.tar.gz':
-                await exec.exec('sh', [
-                    '-c',
-                    `curl -fsSL ${url} | tar -xzf - -C ${os.tmpdir()} && mv ${os.tmpdir()}/mise/bin/mise ${miseBinPath}`
-                ]);
-                break;
-            default:
-                await exec.exec('sh', ['-c', `curl -fsSL ${url} > ${miseBinPath}`]);
-                await exec.exec('chmod', ['+x', miseBinPath]);
-                break;
-        }
-    }
-    core.addPath(miseBinDir);
-}
-async function zstdInstalled() {
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.run = run;
+const core = __importStar(__nccwpck_require__(7484));
+const path = __importStar(__nccwpck_require__(6928));
+const environment_1 = __nccwpck_require__(2678);
+const setup_1 = __nccwpck_require__(8294);
+const cache_1 = __nccwpck_require__(7377);
+const tools_1 = __nccwpck_require__(1732);
+const utils_1 = __nccwpck_require__(1798);
+/**
+ * Main entry point for the mise action
+ */
+async function run() {
     try {
-        await exec.exec('zstd', ['--version']);
-        return true;
+        // Parse configuration from inputs
+        const config = parseConfiguration();
+        // Set up configuration files first
+        await setupConfigurationFiles(config);
+        // Parse all tools from various sources
+        const allTools = await (0, tools_1.getAllTools)();
+        core.info(`Discovered ${allTools.length} tools to manage`);
+        // Handle caching - restore both global and per-tool caches
+        let cacheResult;
+        if (core.getBooleanInput('cache')) {
+            cacheResult = await (0, cache_1.restoreAllCaches)(allTools);
+        }
+        else {
+            core.setOutput('cache-hit', false);
+            core.setOutput('global-cache-hit', false);
+            core.setOutput('partial-cache-hit', false);
+            core.setOutput('tools-cache-hit-ratio', '0/0');
+            cacheResult = {
+                globalCacheHit: false,
+                toolCacheResults: [],
+                totalTools: allTools.length,
+                cachedTools: 0,
+                missingTools: allTools
+            };
+        }
+        // Set up mise binary (skip if restored from global cache)
+        if (!cacheResult.globalCacheHit) {
+            await (0, setup_1.setupMise)(config.version);
+        }
+        else {
+            core.info('Mise binary restored from cache, skipping installation');
+            // Still need to add to PATH
+            const miseBinDir = path.join((0, utils_1.miseDir)(), 'bin');
+            core.addPath(miseBinDir);
+        }
+        // Set up environment variables
+        await (0, environment_1.setupEnvironmentVariables)(config);
+        // Trust current directory for mise configuration
+        await (0, setup_1.trustCurrentDirectory)();
+        // Test mise installation
+        await (0, setup_1.testMise)();
+        // Reshim if requested (before installing new tools)
+        if (core.getBooleanInput('reshim')) {
+            await (0, setup_1.reshimTools)();
+        }
+        // Install tools based on caching results
+        let installedTools = [];
+        if (core.getBooleanInput('install')) {
+            if (cacheResult.missingTools.length > 0) {
+                core.info(`Installing ${cacheResult.missingTools.length} tools that weren't found in cache`);
+                installedTools = await (0, setup_1.installSpecificTools)(cacheResult.missingTools);
+            }
+            else {
+                core.info('All tools were restored from cache, no installation needed');
+            }
+            // Fallback: if no tools were specified but install is requested
+            if (allTools.length === 0 && core.getInput('install_args')) {
+                core.info('No tools found in configuration, falling back to install_args');
+                await (0, setup_1.installAllConfiguredTools)();
+            }
+            // Save cache for newly installed tools
+            if (core.getBooleanInput('cache') && installedTools.length > 0) {
+                await (0, cache_1.saveAllCaches)(cacheResult, installedTools);
+            }
+        }
+        // Final reshim after installing new tools
+        if (core.getBooleanInput('reshim') && installedTools.length > 0) {
+            await (0, setup_1.reshimTools)();
+        }
+        // List installed tools for verification
+        await (0, setup_1.listTools)();
+        // Log final summary
+        logExecutionSummary(cacheResult, installedTools.length);
+    }
+    catch (err) {
+        if (err instanceof Error) {
+            core.setFailed(err.message);
+        }
+        else {
+            throw err;
+        }
+    }
+}
+/**
+ * Parse configuration from GitHub Actions inputs
+ */
+function parseConfiguration() {
+    return {
+        version: core.getInput('version') || undefined,
+        experimental: core.getBooleanInput('experimental'),
+        logLevel: core.getInput('log_level') || undefined,
+        githubToken: core.getInput('github_token') || undefined,
+        workingDirectory: core.getInput('working_directory') || undefined,
+        installDir: core.getInput('install_dir') || undefined,
+        installArgs: core.getInput('install_args') || undefined,
+        toolVersions: core.getInput('tool_versions') || undefined,
+        miseToml: core.getInput('mise_toml') || undefined
+    };
+}
+/**
+ * Set up configuration files (.tool-versions and mise.toml)
+ */
+async function setupConfigurationFiles(config) {
+    await (0, setup_1.setupToolVersions)(config);
+    await (0, setup_1.setupMiseToml)(config);
+}
+/**
+ * Log execution summary
+ */
+function logExecutionSummary(cacheResult, installedCount) {
+    core.info('\n🎉 Mise Action Execution Summary:');
+    core.info(`  📦 Total tools managed: ${cacheResult.totalTools}`);
+    core.info(`  ♻️  Tools restored from cache: ${cacheResult.cachedTools}`);
+    core.info(`  ⬇️  Tools installed: ${installedCount}`);
+    core.info(`  🚀 Cache efficiency: ${cacheResult.totalTools > 0 ? ((cacheResult.cachedTools / cacheResult.totalTools) * 100).toFixed(1) : 0}%`);
+    if (cacheResult.totalTools > 0) {
+        const timesSaved = cacheResult.cachedTools;
+        if (timesSaved > 0) {
+            core.info(`  ⏱️  Estimated time saved: ~${timesSaved * 30}s (assuming 30s per tool)`);
+        }
+    }
+}
+
+
+/***/ }),
+
+/***/ 8294:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.setupMise = setupMise;
+exports.setupToolVersions = setupToolVersions;
+exports.setupMiseToml = setupMiseToml;
+exports.executeMiseCommand = executeMiseCommand;
+exports.testMise = testMise;
+exports.installTools = installTools;
+exports.installSpecificTools = installSpecificTools;
+exports.installAllConfiguredTools = installAllConfiguredTools;
+exports.listTools = listTools;
+exports.reshimTools = reshimTools;
+exports.trustCurrentDirectory = trustCurrentDirectory;
+const core = __importStar(__nccwpck_require__(7484));
+const exec = __importStar(__nccwpck_require__(5236));
+const io = __importStar(__nccwpck_require__(4994));
+const fs = __importStar(__nccwpck_require__(9896));
+const os = __importStar(__nccwpck_require__(857));
+const path = __importStar(__nccwpck_require__(6928));
+const utils_1 = __nccwpck_require__(1798);
+/**
+ * Install mise binary if not already present
+ */
+async function setupMise(version) {
+    const miseBinDir = path.join((0, utils_1.miseDir)(), 'bin');
+    const miseBinPath = path.join(miseBinDir, process.platform === 'win32' ? 'mise.exe' : 'mise');
+    if (fs.existsSync(miseBinPath)) {
+        core.info('mise binary already exists, skipping installation');
+        core.addPath(miseBinDir);
+        return;
+    }
+    core.startGroup(version ? `Download mise@${version}` : 'Setup mise');
+    try {
+        await fs.promises.mkdir(miseBinDir, { recursive: true });
+        await downloadAndInstallMise(version, miseBinPath);
+        core.addPath(miseBinDir);
+        core.info('mise installation completed successfully');
+    }
+    catch (error) {
+        throw new Error(`Failed to setup mise: ${error}`);
+    }
+    finally {
+        core.endGroup();
+    }
+}
+/**
+ * Download and install mise binary
+ */
+async function downloadAndInstallMise(version, miseBinPath) {
+    const systemInfo = await (0, utils_1.getSystemInfo)();
+    const resolvedVersion = (version || (await (0, utils_1.latestMiseVersion)())).replace(/^v/, '');
+    const ext = await getArchiveExtension(resolvedVersion);
+    const url = `https://github.com/jdx/mise/releases/download/v${resolvedVersion}/mise-v${resolvedVersion}-${systemInfo.target}${ext}`;
+    const archivePath = path.join(os.tmpdir(), `mise${ext}`);
+    core.info(`Downloading mise from: ${url}`);
+    switch (ext) {
+        case '.zip':
+            await downloadAndExtractZip(url, archivePath, miseBinPath);
+            break;
+        case '.tar.zst':
+            await downloadAndExtractTarZst(url, miseBinPath);
+            break;
+        case '.tar.gz':
+            await downloadAndExtractTarGz(url, miseBinPath);
+            break;
+        default:
+            await downloadRawBinary(url, miseBinPath);
+            break;
+    }
+}
+/**
+ * Determine the appropriate archive extension
+ */
+async function getArchiveExtension(version) {
+    if (process.platform === 'win32') {
+        return '.zip';
+    }
+    if (version.startsWith('2024')) {
+        return '';
+    }
+    return (await (0, utils_1.zstdInstalled)()) ? '.tar.zst' : '.tar.gz';
+}
+/**
+ * Download and extract ZIP archive
+ */
+async function downloadAndExtractZip(url, archivePath, miseBinPath) {
+    await exec.exec('curl', ['-fsSL', url, '--output', archivePath]);
+    await exec.exec('unzip', [archivePath, '-d', os.tmpdir()]);
+    await io.mv(path.join(os.tmpdir(), 'mise/bin/mise.exe'), miseBinPath);
+}
+/**
+ * Download and extract tar.zst archive
+ */
+async function downloadAndExtractTarZst(url, miseBinPath) {
+    await exec.exec('sh', [
+        '-c',
+        `curl -fsSL ${url} | tar --zstd -xf - -C ${os.tmpdir()} && mv ${os.tmpdir()}/mise/bin/mise ${miseBinPath}`
+    ]);
+}
+/**
+ * Download and extract tar.gz archive
+ */
+async function downloadAndExtractTarGz(url, miseBinPath) {
+    await exec.exec('sh', [
+        '-c',
+        `curl -fsSL ${url} | tar -xzf - -C ${os.tmpdir()} && mv ${os.tmpdir()}/mise/bin/mise ${miseBinPath}`
+    ]);
+}
+/**
+ * Download raw binary
+ */
+async function downloadRawBinary(url, miseBinPath) {
+    await exec.exec('sh', ['-c', `curl -fsSL ${url} > ${miseBinPath}`]);
+    await exec.exec('chmod', ['+x', miseBinPath]);
+}
+/**
+ * Set up tool versions file if provided
+ */
+async function setupToolVersions(config) {
+    if (config.toolVersions) {
+        await (0, utils_1.writeFile)('.tool-versions', config.toolVersions);
+    }
+}
+/**
+ * Set up mise.toml file if provided
+ */
+async function setupMiseToml(config) {
+    if (config.miseToml) {
+        await (0, utils_1.writeFile)('mise.toml', config.miseToml);
+    }
+}
+/**
+ * Execute a mise command
+ */
+async function executeMiseCommand(args) {
+    return core.group(`Running mise ${args.join(' ')}`, async () => {
+        const cwd = (0, utils_1.getWorkingDirectory)();
+        const env = core.isDebug()
+            ? { ...process.env, MISE_LOG_LEVEL: 'debug' }
+            : undefined;
+        if (args.length === 1) {
+            return exec.exec(`mise ${args[0]}`, [], { cwd, env });
+        }
+        else {
+            return exec.exec('mise', args, { cwd, env });
+        }
+    });
+}
+/**
+ * Test mise installation
+ */
+async function testMise() {
+    return executeMiseCommand(['--version']);
+}
+/**
+ * Install all tools using mise install
+ * @deprecated Use installSpecificTools for selective installation
+ */
+async function installTools(installArgs) {
+    const args = installArgs ? `install ${installArgs}` : 'install';
+    return executeMiseCommand([args]);
+}
+/**
+ * Install only specific tools that weren't restored from cache
+ */
+async function installSpecificTools(tools) {
+    if (tools.length === 0) {
+        core.info('No tools to install');
+        return [];
+    }
+    core.startGroup(`Installing ${tools.length} tools`);
+    const installedTools = [];
+    try {
+        // Install tools one by one for better error handling and caching
+        for (const tool of tools) {
+            try {
+                core.info(`Installing ${tool.name}@${tool.version}...`);
+                const result = await executeMiseCommand([
+                    'install',
+                    `${tool.name}@${tool.version}`
+                ]);
+                if (result === 0) {
+                    core.info(`✓ Successfully installed ${tool.name}@${tool.version}`);
+                    installedTools.push(tool);
+                }
+                else {
+                    core.warning(`Failed to install ${tool.name}@${tool.version}`);
+                }
+            }
+            catch (error) {
+                core.warning(`Error installing ${tool.name}@${tool.version}: ${error}`);
+            }
+        }
+        core.info(`Successfully installed ${installedTools.length}/${tools.length} tools`);
+    }
+    catch (error) {
+        core.error(`Failed to install tools: ${error}`);
+    }
+    finally {
+        core.endGroup();
+    }
+    return installedTools;
+}
+/**
+ * Install all tools from configuration (fallback method)
+ */
+async function installAllConfiguredTools() {
+    core.info('Installing all tools from configuration...');
+    return executeMiseCommand(['install']);
+}
+/**
+ * List installed tools
+ */
+async function listTools() {
+    return executeMiseCommand(['ls']);
+}
+/**
+ * Reshim all tools
+ */
+async function reshimTools() {
+    return executeMiseCommand(['reshim', '--all']);
+}
+/**
+ * Trust the current directory for mise configuration
+ */
+async function trustCurrentDirectory() {
+    const cwd = (0, utils_1.getWorkingDirectory)();
+    core.info(`Trusting directory: ${cwd}`);
+    return executeMiseCommand(['trust', cwd]);
+}
+
+
+/***/ }),
+
+/***/ 1732:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.getAllTools = getAllTools;
+exports.generateToolHash = generateToolHash;
+exports.toolsToInstallArgs = toolsToInstallArgs;
+const core = __importStar(__nccwpck_require__(7484));
+const fs = __importStar(__nccwpck_require__(9896));
+const glob = __importStar(__nccwpck_require__(7206));
+/**
+ * Parse and collect all tools from various configuration sources
+ */
+async function getAllTools() {
+    const tools = [];
+    // Parse from install_args parameter
+    const installArgsTools = parseInstallArgs();
+    tools.push(...installArgsTools);
+    // Parse from .tool-versions files
+    const toolVersionsTools = await parseToolVersionsFiles();
+    tools.push(...toolVersionsTools);
+    // Parse from mise.toml files
+    const miseTomlTools = await parseMiseTomlFiles();
+    tools.push(...miseTomlTools);
+    // Remove duplicates, preferring more specific sources
+    const uniqueTools = deduplicateTools(tools);
+    core.info(`Found ${uniqueTools.length} tools to manage`);
+    uniqueTools.forEach(tool => {
+        core.info(`  - ${tool.name}@${tool.version} (from ${tool.source})`);
+    });
+    return uniqueTools;
+}
+/**
+ * Parse tools from install_args input parameter
+ */
+function parseInstallArgs() {
+    const installArgs = core.getInput('install_args');
+    if (!installArgs)
+        return [];
+    const tools = [];
+    const args = installArgs
+        .split(' ')
+        .filter(arg => arg.trim() && !arg.startsWith('-'));
+    for (const arg of args) {
+        const tool = parseToolSpec(arg, 'install_args');
+        if (tool)
+            tools.push(tool);
+    }
+    return tools;
+}
+/**
+ * Parse tools from all .tool-versions files
+ */
+async function parseToolVersionsFiles() {
+    const tools = [];
+    try {
+        const globber = await glob.create('**/.tool-versions', {
+            followSymbolicLinks: false
+        });
+        const files = await globber.glob();
+        for (const file of files) {
+            const fileTools = await parseToolVersionsFile(file);
+            tools.push(...fileTools);
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to parse .tool-versions files: ${error}`);
+    }
+    return tools;
+}
+/**
+ * Parse a single .tool-versions file
+ */
+async function parseToolVersionsFile(filePath) {
+    const tools = [];
+    try {
+        const content = await fs.promises.readFile(filePath, 'utf8');
+        const lines = content
+            .split('\n')
+            .filter(line => line.trim() && !line.startsWith('#'));
+        for (const line of lines) {
+            const [name, version] = line.trim().split(/\s+/);
+            if (name && version) {
+                tools.push({ name, version, source: '.tool-versions' });
+            }
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to parse ${filePath}: ${error}`);
+    }
+    return tools;
+}
+/**
+ * Parse tools from all mise.toml files
+ */
+async function parseMiseTomlFiles() {
+    const tools = [];
+    try {
+        const globber = await glob.create('**/mise.toml', {
+            followSymbolicLinks: false
+        });
+        const files = await globber.glob();
+        for (const file of files) {
+            const fileTools = await parseMiseTomlFile(file);
+            tools.push(...fileTools);
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to parse mise.toml files: ${error}`);
+    }
+    return tools;
+}
+/**
+ * Parse a single mise.toml file
+ * This is a simplified parser that handles basic [tools] sections
+ */
+async function parseMiseTomlFile(filePath) {
+    const tools = [];
+    try {
+        const content = await fs.promises.readFile(filePath, 'utf8');
+        const lines = content.split('\n');
+        let inToolsSection = false;
+        for (const line of lines) {
+            const trimmed = line.trim();
+            // Check for [tools] section
+            if (trimmed === '[tools]') {
+                inToolsSection = true;
+                continue;
+            }
+            // Check for new section
+            if (trimmed.startsWith('[') && trimmed !== '[tools]') {
+                inToolsSection = false;
+                continue;
+            }
+            // Parse tool entries in [tools] section
+            if (inToolsSection && trimmed && !trimmed.startsWith('#')) {
+                const tool = parseTomlToolLine(trimmed);
+                if (tool)
+                    tools.push(tool);
+            }
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to parse ${filePath}: ${error}`);
+    }
+    return tools;
+}
+/**
+ * Parse a single tool line from TOML format
+ * Supports formats like: node = "18.17.0", python = {version = "3.11.0"}
+ */
+function parseTomlToolLine(line) {
+    try {
+        const match = line.match(/^(\w+)\s*=\s*(.+)$/);
+        if (!match)
+            return null;
+        const [, name, value] = match;
+        let version;
+        // Handle simple string format: node = "18.17.0"
+        const stringMatch = value.match(/^["']([^"']+)["']$/);
+        if (stringMatch) {
+            version = stringMatch[1];
+        }
+        else {
+            // Handle object format: python = {version = "3.11.0"}
+            const objectMatch = value.match(/version\s*=\s*["']([^"']+)["']/);
+            if (objectMatch) {
+                version = objectMatch[1];
+            }
+            else {
+                return null;
+            }
+        }
+        return { name, version, source: 'mise.toml' };
     }
     catch {
-        return false;
+        return null;
     }
 }
-async function latestMiseVersion() {
-    const rsp = await exec.getExecOutput('curl', [
-        '-fsSL',
-        'https://mise.jdx.dev/VERSION'
-    ]);
-    return rsp.stdout.trim();
-}
-async function setToolVersions() {
-    const toolVersions = core.getInput('tool_versions');
-    if (toolVersions) {
-        await writeFile('.tool-versions', toolVersions);
+/**
+ * Parse a tool specification (e.g., "node@18.17.0", "python@3.11")
+ */
+function parseToolSpec(spec, source) {
+    try {
+        const parts = spec.split('@');
+        if (parts.length !== 2)
+            return null;
+        const [name, version] = parts;
+        if (!name || !version)
+            return null;
+        return { name: name.trim(), version: version.trim(), source };
+    }
+    catch {
+        return null;
     }
 }
-async function setMiseToml() {
-    const toml = core.getInput('mise_toml');
-    if (toml) {
-        await writeFile('mise.toml', toml);
+/**
+ * Remove duplicate tools, preferring more specific sources
+ * Priority: install_args > mise.toml > .tool-versions
+ */
+function deduplicateTools(tools) {
+    const toolMap = new Map();
+    const sourcePriority = {
+        install_args: 3,
+        'mise.toml': 2,
+        '.tool-versions': 1
+    };
+    for (const tool of tools) {
+        const key = tool.name;
+        const existing = toolMap.get(key);
+        if (!existing ||
+            sourcePriority[tool.source] > sourcePriority[existing.source]) {
+            toolMap.set(key, tool);
+        }
     }
+    return Array.from(toolMap.values()).sort((a, b) => a.name.localeCompare(b.name));
 }
-const testMise = async () => mise(['--version']);
-const miseInstall = async () => mise([`install ${core.getInput('install_args')}`]);
-const miseLs = async () => mise([`ls`]);
-const miseReshim = async () => mise([`reshim`, `--all`]);
-const mise = async (args) => core.group(`Running mise ${args.join(' ')}`, async () => {
-    const cwd = core.getInput('working_directory') ||
-        core.getInput('install_dir') ||
-        process.cwd();
-    const env = core.isDebug()
-        ? { ...process.env, MISE_LOG_LEVEL: 'debug' }
-        : undefined;
-    if (args.length === 1) {
-        return exec.exec(`mise ${args}`, [], {
-            cwd,
-            env
-        });
+/**
+ * Generate a stable hash for a tool based on name and version
+ */
+function generateToolHash(tool) {
+    return `${tool.name}-${tool.version}`;
+}
+/**
+ * Convert tools list to mise install command arguments
+ */
+function toolsToInstallArgs(tools) {
+    return tools.map(tool => `${tool.name}@${tool.version}`).join(' ');
+}
+
+
+/***/ }),
+
+/***/ 1798:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
     }
-    else {
-        return exec.exec('mise', args, { cwd, env });
-    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
 });
-const writeFile = async (p, body) => core.group(`Writing ${p}`, async () => {
-    core.info(`Body:\n${body}`);
-    await fs.promises.writeFile(p, body, { encoding: 'utf8' });
-});
-run();
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.miseDir = miseDir;
+exports.getSystemInfo = getSystemInfo;
+exports.zstdInstalled = zstdInstalled;
+exports.latestMiseVersion = latestMiseVersion;
+exports.writeFile = writeFile;
+exports.getWorkingDirectory = getWorkingDirectory;
+const core = __importStar(__nccwpck_require__(7484));
+const exec = __importStar(__nccwpck_require__(5236));
+const fs = __importStar(__nccwpck_require__(9896));
+const os = __importStar(__nccwpck_require__(857));
+const path = __importStar(__nccwpck_require__(6928));
+/**
+ * Get the mise data directory path
+ */
 function miseDir() {
     const dir = core.getState('MISE_DIR');
     if (dir)
@@ -66764,41 +67624,90 @@ function miseDir() {
         return path.join(LOCALAPPDATA, 'mise');
     return path.join(os.homedir(), '.local', 'share', 'mise');
 }
-async function saveCache(cacheKey) {
-    core.group(`Saving mise cache`, async () => {
-        const cachePath = miseDir();
-        if (!fs.existsSync(cachePath)) {
-            throw new Error(`Cache folder path does not exist on disk: ${cachePath}`);
-        }
-        const cacheId = await cache.saveCache([cachePath], cacheKey);
-        if (cacheId === -1)
-            return;
-        core.info(`Cache saved from ${cachePath} with key: ${cacheKey}`);
-    });
-}
-async function getTarget() {
+/**
+ * Get system target information for binary downloads
+ */
+async function getSystemInfo() {
     let { arch } = process;
     // quick overwrite to abide by release format
     if (arch === 'arm')
         arch = 'armv7';
+    const isMusl = await checkIsMusl();
+    let target;
     switch (process.platform) {
         case 'darwin':
-            return `macos-${arch}`;
+            target = `macos-${arch}`;
+            break;
         case 'win32':
-            return `windows-${arch}`;
+            target = `windows-${arch}`;
+            break;
         case 'linux':
-            return `linux-${arch}${(await isMusl()) ? '-musl' : ''}`;
+            target = `linux-${arch}${isMusl ? '-musl' : ''}`;
+            break;
         default:
             throw new Error(`Unsupported platform ${process.platform}`);
     }
+    return {
+        platform: process.platform,
+        arch,
+        target,
+        isMusl
+    };
 }
-async function isMusl() {
-    // `ldd --version` always returns 1 and print to stderr
-    const { stderr } = await exec.getExecOutput('ldd', ['--version'], {
-        failOnStdErr: false,
-        ignoreReturnCode: true
+/**
+ * Check if system uses musl libc
+ */
+async function checkIsMusl() {
+    try {
+        // `ldd --version` always returns 1 and print to stderr
+        const { stderr } = await exec.getExecOutput('ldd', ['--version'], {
+            failOnStdErr: false,
+            ignoreReturnCode: true
+        });
+        return stderr.indexOf('musl') > -1;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Check if zstd is installed on the system
+ */
+async function zstdInstalled() {
+    try {
+        await exec.exec('zstd', ['--version']);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Get the latest mise version from the release endpoint
+ */
+async function latestMiseVersion() {
+    const rsp = await exec.getExecOutput('curl', [
+        '-fsSL',
+        'https://mise.jdx.dev/VERSION'
+    ]);
+    return rsp.stdout.trim();
+}
+/**
+ * Write content to a file with logging
+ */
+async function writeFile(filePath, body) {
+    return core.group(`Writing ${filePath}`, async () => {
+        core.info(`Body:\n${body}`);
+        await fs.promises.writeFile(filePath, body, { encoding: 'utf8' });
     });
-    return stderr.indexOf('musl') > -1;
+}
+/**
+ * Get current working directory based on inputs
+ */
+function getWorkingDirectory() {
+    return (core.getInput('working_directory') ||
+        core.getInput('install_dir') ||
+        process.cwd());
 }
 
 
@@ -80293,13 +81202,20 @@ module.exports = /*#__PURE__*/JSON.parse('{"name":"@actions/cache","version":"4.
 /******/ 	if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = __dirname + "/";
 /******/ 	
 /************************************************************************/
-/******/ 	
-/******/ 	// startup
-/******/ 	// Load entry module and return exports
-/******/ 	// This entry module is referenced by other modules so it can't be inlined
-/******/ 	var __webpack_exports__ = __nccwpck_require__(9407);
-/******/ 	module.exports = __webpack_exports__;
-/******/ 	
+var __webpack_exports__ = {};
+// This entry need to be wrapped in an IIFE because it need to be in strict mode.
+(() => {
+"use strict";
+var exports = __webpack_exports__;
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+const main_1 = __nccwpck_require__(1730);
+// Execute the main function
+(0, main_1.run)();
+
+})();
+
+module.exports = __webpack_exports__;
 /******/ })()
 ;
 //# sourceMappingURL=index.js.map

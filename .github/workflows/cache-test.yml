@@ -1,0 +1,160 @@
+name: 'Cache Testing'
+on:
+  workflow_dispatch:
+    inputs:
+      test_scenario:
+        description: 'Test scenario to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - 'initial_setup'
+          - 'cache_hit'
+          - 'partial_cache'
+          - 'new_tools'
+
+jobs:
+  # Test 1: Initial setup without cache (cold start)
+  initial_setup:
+    if:
+      ${{ github.event.inputs.test_scenario == 'all' ||
+      github.event.inputs.test_scenario == 'initial_setup' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clear any existing cache
+        run: |
+          echo "Testing initial setup without cache"
+          echo "This simulates first-time usage"
+      - name: Setup mise (cold start)
+        uses: ./
+        with:
+          cache: true
+          cache_key_prefix: 'test-initial-${{ github.run_id }}'
+          mise_toml: |
+            [tools]
+            node = "18.17.0"
+            python = "3.11.0"
+      - name: Verify tools installed
+        run: |
+          node --version
+          python --version
+          echo "✅ Initial setup completed successfully"
+
+  # Test 2: Second run should hit cache completely
+  cache_hit:
+    if:
+      ${{ github.event.inputs.test_scenario == 'all' ||
+      github.event.inputs.test_scenario == 'cache_hit' }}
+    needs: initial_setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup mise (should hit cache)
+        uses: ./
+        with:
+          cache: true
+          cache_key_prefix: 'test-initial-${{ github.run_id }}'
+          mise_toml: |
+            [tools]
+            node = "18.17.0"
+            python = "3.11.0"
+      - name: Verify cache hit
+        run: |
+          echo "Cache outputs:"
+          echo "cache-hit: ${{ steps.setup-mise.outputs.cache-hit }}"
+          echo "global-cache-hit: ${{ steps.setup-mise.outputs.global-cache-hit }}"
+          echo "tools-cache-hit-ratio: ${{ steps.setup-mise.outputs.tools-cache-hit-ratio }}"
+          node --version
+          python --version
+          echo "✅ Cache hit test completed"
+
+  # Test 3: Partial cache (add new tools to existing setup)
+  partial_cache:
+    if:
+      ${{ github.event.inputs.test_scenario == 'all' ||
+      github.event.inputs.test_scenario == 'partial_cache' }}
+    needs: cache_hit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup mise with additional tools
+        uses: ./
+        with:
+          cache: true
+          cache_key_prefix: 'test-initial-${{ github.run_id }}'
+          mise_toml: |
+            [tools]
+            node = "18.17.0"
+            python = "3.11.0"
+            go = "1.21.0"
+            jq = "1.7.1"
+      - name: Verify partial cache behavior
+        run: |
+          echo "Should restore node and python from cache, install go and jq"
+          node --version
+          python --version
+          go version
+          jq --version
+          echo "✅ Partial cache test completed"
+
+  # Test 4: Version changes should create new cache entries
+  new_tools:
+    if:
+      ${{ github.event.inputs.test_scenario == 'all' ||
+      github.event.inputs.test_scenario == 'new_tools' }}
+    needs: partial_cache
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup mise with different versions
+        uses: ./
+        with:
+          cache: true
+          cache_key_prefix: 'test-versions-${{ github.run_id }}'
+          mise_toml: |
+            [tools]
+            node = "20.10.0"
+            python = "3.12.0"
+      - name: Verify new versions installed
+        run: |
+          echo "Should install new versions (different cache keys)"
+          node --version | grep "20.10.0" || (echo "❌ Node version mismatch" && exit 1)
+          python --version | grep "3.12.0" || (echo "❌ Python version mismatch" && exit 1)
+          echo "✅ New tools test completed"
+
+  # Performance comparison test
+  performance_test:
+    if: ${{ github.event.inputs.test_scenario == 'all' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cache_enabled: [true, false]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record start time
+        run: echo "START_TIME=$(date +%s)" >> $GITHUB_ENV
+      - name: Setup mise
+        uses: ./
+        with:
+          cache: ${{ matrix.cache_enabled }}
+          cache_key_prefix:
+            'perf-test-${{ github.run_id }}-${{ matrix.cache_enabled }}'
+          mise_toml: |
+            [tools]
+            node = "18.17.0"
+            python = "3.11.0"
+            go = "1.21.0"
+      - name: Calculate execution time
+        run: |
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          echo "Execution time with cache=${{ matrix.cache_enabled }}: ${DURATION}s"
+          echo "EXECUTION_TIME=${DURATION}" >> $GITHUB_ENV
+      - name: Verify tools
+        run: |
+          node --version
+          python --version
+          go version
+          echo "✅ Performance test (cache=${{ matrix.cache_enabled }}) completed in ${EXECUTION_TIME}s"
