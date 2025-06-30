@@ -106,46 +106,46 @@ async function restoreToolCaches(
   target: string,
   keyPrefix: string
 ): Promise<ToolCacheInfo[]> {
-  const results: ToolCacheInfo[] = []
+  const results = await Promise.all(
+    tools.map(async tool => {
+      const toolHash = generateToolHash(tool)
+      const toolCacheKey = `${keyPrefix}-${target}-tool-${toolHash}`
+      const toolCachePath = path.join(
+        miseDir(),
+        'installs',
+        tool.name,
+        tool.version
+      )
 
-  for (const tool of tools) {
-    const toolHash = generateToolHash(tool)
-    const toolCacheKey = `${keyPrefix}-${target}-tool-${toolHash}`
-    const toolCachePath = path.join(
-      miseDir(),
-      'installs',
-      tool.name,
-      tool.version
-    )
+      core.info(`Checking tool cache: ${tool.name}@${tool.version}`)
 
-    core.info(`Checking tool cache: ${tool.name}@${tool.version}`)
+      try {
+        const cacheKey = await cache.restoreCache([toolCachePath], toolCacheKey)
+        const isRestored = Boolean(cacheKey)
 
-    try {
-      const cacheKey = await cache.restoreCache([toolCachePath], toolCacheKey)
-      const isRestored = Boolean(cacheKey)
+        if (isRestored) {
+          core.info(`  ✓ Restored from cache: ${cacheKey}`)
+        } else {
+          core.info(`  ✗ Not found in cache`)
+        }
 
-      if (isRestored) {
-        core.info(`  ✓ Restored from cache: ${cacheKey}`)
-      } else {
-        core.info(`  ✗ Not found in cache`)
+        return {
+          tool,
+          cacheKey: toolCacheKey,
+          cachePath: toolCachePath,
+          isRestored
+        }
+      } catch (error) {
+        core.warning(`Failed to restore cache for ${tool.name}: ${error}`)
+        return {
+          tool,
+          cacheKey: toolCacheKey,
+          cachePath: toolCachePath,
+          isRestored: false
+        }
       }
-
-      results.push({
-        tool,
-        cacheKey: toolCacheKey,
-        cachePath: toolCachePath,
-        isRestored
-      })
-    } catch (error) {
-      core.warning(`Failed to restore cache for ${tool.name}: ${error}`)
-      results.push({
-        tool,
-        cacheKey: toolCacheKey,
-        cachePath: toolCachePath,
-        isRestored: false
-      })
-    }
-  }
+    })
+  )
 
   return results
 }
@@ -171,7 +171,7 @@ export async function saveAllCaches(
     }
 
     // Save caches for newly installed tools
-    for (const tool of installedTools) {
+    const savePromises = installedTools.map(async tool => {
       const toolCacheInfo = cacheResult.toolCacheResults.find(
         t => t.tool.name === tool.name && t.tool.version === tool.version
       )
@@ -179,7 +179,9 @@ export async function saveAllCaches(
       if (toolCacheInfo && !toolCacheInfo.isRestored) {
         await saveToolCache(toolCacheInfo)
       }
-    }
+    })
+
+    await Promise.all(savePromises)
   } catch (error) {
     core.warning(`Failed to save caches: ${error}`)
   } finally {

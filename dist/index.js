@@ -66608,8 +66608,7 @@ async function restoreGlobalMiseCache(target, version, keyPrefix) {
  * Restore individual tool caches
  */
 async function restoreToolCaches(tools, target, keyPrefix) {
-    const results = [];
-    for (const tool of tools) {
+    const results = await Promise.all(tools.map(async (tool) => {
         const toolHash = (0, tools_1.generateToolHash)(tool);
         const toolCacheKey = `${keyPrefix}-${target}-tool-${toolHash}`;
         const toolCachePath = path.join((0, utils_1.miseDir)(), 'installs', tool.name, tool.version);
@@ -66623,23 +66622,23 @@ async function restoreToolCaches(tools, target, keyPrefix) {
             else {
                 core.info(`  ✗ Not found in cache`);
             }
-            results.push({
+            return {
                 tool,
                 cacheKey: toolCacheKey,
                 cachePath: toolCachePath,
                 isRestored
-            });
+            };
         }
         catch (error) {
             core.warning(`Failed to restore cache for ${tool.name}: ${error}`);
-            results.push({
+            return {
                 tool,
                 cacheKey: toolCacheKey,
                 cachePath: toolCachePath,
                 isRestored: false
-            });
+            };
         }
-    }
+    }));
     return results;
 }
 /**
@@ -66657,12 +66656,13 @@ async function saveAllCaches(cacheResult, installedTools) {
             await saveGlobalMiseCache();
         }
         // Save caches for newly installed tools
-        for (const tool of installedTools) {
+        const savePromises = installedTools.map(async (tool) => {
             const toolCacheInfo = cacheResult.toolCacheResults.find(t => t.tool.name === tool.name && t.tool.version === tool.version);
             if (toolCacheInfo && !toolCacheInfo.isRestored) {
                 await saveToolCache(toolCacheInfo);
             }
-        }
+        });
+        await Promise.all(savePromises);
     }
     catch (error) {
         core.warning(`Failed to save caches: ${error}`);
