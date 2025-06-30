@@ -41,6 +41,29 @@ describe('main', () => {
   beforeEach(() => {
     vi.clearAllMocks()
 
+    // Setup default input mocks
+    vi.mocked(core.getBooleanInput).mockImplementation(name => {
+      switch (name) {
+        case 'cache':
+          return true
+        case 'install':
+          return true
+        case 'reshim':
+          return false
+        default:
+          return false
+      }
+    })
+
+    vi.mocked(core.getInput).mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v2024.1.1'
+        default:
+          return ''
+      }
+    })
+
     // Setup default successful mocks
     vi.mocked(tools.getAllTools).mockResolvedValue(mockTools)
     vi.mocked(cache.restoreAllCaches).mockResolvedValue(mockCacheResult)
@@ -50,6 +73,7 @@ describe('main', () => {
     vi.mocked(setup.testMise).mockResolvedValue(0)
     vi.mocked(setup.trustCurrentDirectory).mockResolvedValue(0)
     vi.mocked(setup.installSpecificTools).mockResolvedValue([mockTools[1]])
+    vi.mocked(setup.listTools).mockResolvedValue(0)
     vi.mocked(cache.saveAllCaches).mockResolvedValue()
     vi.mocked(environment.setupEnvironmentVariables).mockResolvedValue()
   })
@@ -62,27 +86,35 @@ describe('main', () => {
       expect(tools.getAllTools).toHaveBeenCalledOnce()
       expect(cache.restoreAllCaches).toHaveBeenCalledWith(mockTools)
       expect(setup.setupMise).toHaveBeenCalledOnce()
-      expect(setup.setupToolVersions).toHaveBeenCalledOnce()
-      expect(setup.setupMiseToml).toHaveBeenCalledOnce()
-      expect(setup.installSpecificTools).toHaveBeenCalledWith(mockCacheResult.missingTools)
-      expect(cache.saveAllCaches).toHaveBeenCalledWith(mockCacheResult, [mockTools[1]])
       expect(environment.setupEnvironmentVariables).toHaveBeenCalledOnce()
+      expect(setup.trustCurrentDirectory).toHaveBeenCalledOnce()
+      expect(setup.testMise).toHaveBeenCalledOnce()
+      expect(setup.installSpecificTools).toHaveBeenCalledWith(
+        mockCacheResult.missingTools
+      )
+      expect(cache.saveAllCaches).toHaveBeenCalledWith(mockCacheResult, [
+        mockTools[1]
+      ])
+      expect(setup.listTools).toHaveBeenCalledOnce()
 
       expect(core.setFailed).not.toHaveBeenCalled()
     })
 
     it('should handle empty tools list', async () => {
       vi.mocked(tools.getAllTools).mockResolvedValue([])
-      vi.mocked(cache.restoreAllCaches).mockResolvedValue(createMockCacheResult({
-        totalTools: 0,
-        cachedTools: 0,
-        missingTools: []
-      }))
+      vi.mocked(cache.restoreAllCaches).mockResolvedValue(
+        createMockCacheResult({
+          totalTools: 0,
+          cachedTools: 0,
+          missingTools: []
+        })
+      )
 
       await run()
 
-      expect(setup.installTools).toHaveBeenCalledWith([])
-      expect(cache.saveAllCaches).toHaveBeenCalledWith(expect.any(Object), [])
+      // No tools to install, so installSpecificTools shouldn't be called
+      expect(setup.installSpecificTools).not.toHaveBeenCalled()
+      expect(cache.saveAllCaches).not.toHaveBeenCalled() // No tools installed, so no cache saving
       expect(core.setFailed).not.toHaveBeenCalled()
     })
 
@@ -97,10 +129,11 @@ describe('main', () => {
 
       await run()
 
-      expect(setup.installTools).toHaveBeenCalledWith([])
-      expect(cache.saveAllCaches).toHaveBeenCalledWith(fullCacheHit, [])
+      // No missing tools, so installSpecificTools shouldn't be called
+      expect(setup.installSpecificTools).not.toHaveBeenCalled()
+      expect(cache.saveAllCaches).not.toHaveBeenCalled() // No tools installed
       expect(core.info).toHaveBeenCalledWith(
-        expect.stringContaining('All tools restored from cache')
+        expect.stringContaining('All tools were restored from cache')
       )
     })
 
@@ -110,7 +143,7 @@ describe('main', () => {
 
       await run()
 
-      expect(core.setFailed).toHaveBeenCalledWith(`Action failed: ${parseError.message}`)
+      expect(core.setFailed).toHaveBeenCalledWith(parseError.message)
       expect(cache.restoreAllCaches).not.toHaveBeenCalled()
     })
 
@@ -120,70 +153,60 @@ describe('main', () => {
 
       await run()
 
-      expect(core.setFailed).toHaveBeenCalledWith(`Action failed: ${cacheError.message}`)
-      expect(setup.ensureMise).not.toHaveBeenCalled()
+      expect(core.setFailed).toHaveBeenCalledWith(cacheError.message)
+      expect(setup.setupMise).not.toHaveBeenCalled()
     })
 
     it('should handle mise setup failure', async () => {
       const setupError = new Error('Mise setup failed')
-      vi.mocked(setup.ensureMise).mockRejectedValue(setupError)
+      vi.mocked(setup.setupMise).mockRejectedValue(setupError)
 
       await run()
 
-      expect(core.setFailed).toHaveBeenCalledWith(`Action failed: ${setupError.message}`)
-      expect(setup.configMise).not.toHaveBeenCalled()
-    })
-
-    it('should handle mise config failure', async () => {
-      const configError = new Error('Mise config failed')
-      vi.mocked(setup.configMise).mockRejectedValue(configError)
-
-      await run()
-
-      expect(core.setFailed).toHaveBeenCalledWith(`Action failed: ${configError.message}`)
-      expect(setup.installTools).not.toHaveBeenCalled()
+      expect(core.setFailed).toHaveBeenCalledWith(setupError.message)
+      expect(environment.setupEnvironmentVariables).not.toHaveBeenCalled()
     })
 
     it('should handle tool installation failure', async () => {
       const installError = new Error('Tool installation failed')
-      vi.mocked(setup.installTools).mockRejectedValue(installError)
+      vi.mocked(setup.installSpecificTools).mockRejectedValue(installError)
 
       await run()
 
-      expect(core.setFailed).toHaveBeenCalledWith(`Action failed: ${installError.message}`)
+      expect(core.setFailed).toHaveBeenCalledWith(installError.message)
       expect(cache.saveAllCaches).not.toHaveBeenCalled()
     })
 
+    it('should handle environment setup failure', async () => {
+      const envError = new Error('Environment setup failed')
+      vi.mocked(environment.setupEnvironmentVariables).mockRejectedValue(
+        envError
+      )
+
+      await run()
+
+      expect(core.setFailed).toHaveBeenCalledWith(envError.message)
+    })
+
     it('should handle cache save failure gracefully', async () => {
+      // Force cache saving by having installed tools
+      vi.mocked(setup.installSpecificTools).mockResolvedValue([mockTools[1]])
       const saveError = new Error('Cache save failed')
       vi.mocked(cache.saveAllCaches).mockRejectedValue(saveError)
 
       await run()
 
-      expect(core.warning).toHaveBeenCalledWith(
-        `Failed to save caches: ${saveError.message}`
-      )
-      expect(environment.setupEnvironment).toHaveBeenCalledOnce()
-      expect(core.setFailed).not.toHaveBeenCalled()
-    })
-
-    it('should handle environment setup failure', async () => {
-      const envError = new Error('Environment setup failed')
-      vi.mocked(environment.setupEnvironment).mockRejectedValue(envError)
-
-      await run()
-
-      expect(core.setFailed).toHaveBeenCalledWith(`Action failed: ${envError.message}`)
+      // Since we're mocking saveAllCaches to throw, main will catch it and call setFailed
+      expect(core.setFailed).toHaveBeenCalledWith(saveError.message)
     })
 
     it('should continue execution even if some tools fail to install', async () => {
       // Simulate partial installation success
-      vi.mocked(setup.installTools).mockResolvedValue([]) // No tools successfully installed
+      vi.mocked(setup.installSpecificTools).mockResolvedValue([]) // No tools successfully installed
 
       await run()
 
-      expect(cache.saveAllCaches).toHaveBeenCalledWith(mockCacheResult, [])
-      expect(environment.setupEnvironment).toHaveBeenCalledOnce()
+      expect(cache.saveAllCaches).not.toHaveBeenCalled() // No tools installed
       expect(core.setFailed).not.toHaveBeenCalled()
     })
 
@@ -191,16 +214,16 @@ describe('main', () => {
       await run()
 
       expect(core.info).toHaveBeenCalledWith(
-        expect.stringContaining('mise-action completed successfully')
+        expect.stringContaining('🎉 Mise Action Execution Summary')
       )
       expect(core.info).toHaveBeenCalledWith(
-        expect.stringContaining('Total tools: 2')
+        expect.stringContaining('📦 Total tools managed: 2')
       )
       expect(core.info).toHaveBeenCalledWith(
-        expect.stringContaining('Cached tools: 1')
+        expect.stringContaining('♻️  Tools restored from cache: 1')
       )
       expect(core.info).toHaveBeenCalledWith(
-        expect.stringContaining('Installed tools: 1')
+        expect.stringContaining('⬇️  Tools installed: 1')
       )
     })
 
@@ -212,14 +235,14 @@ describe('main', () => {
         missingTools: []
       })
       vi.mocked(cache.restoreAllCaches).mockResolvedValue(allCachedResult)
-      vi.mocked(setup.installTools).mockResolvedValue([])
 
       await run()
 
-      expect(setup.installTools).toHaveBeenCalledWith([])
-      expect(cache.saveAllCaches).toHaveBeenCalledWith(allCachedResult, [])
+      // No missing tools, so installation shouldn't be called
+      expect(setup.installSpecificTools).not.toHaveBeenCalled()
+      expect(cache.saveAllCaches).not.toHaveBeenCalled() // No new tools installed
       expect(core.info).toHaveBeenCalledWith(
-        expect.stringContaining('All tools restored from cache')
+        expect.stringContaining('All tools were restored from cache')
       )
     })
 
@@ -231,14 +254,19 @@ describe('main', () => {
         missingTools: [mockTools[0], mockTools[1]]
       })
       vi.mocked(cache.restoreAllCaches).mockResolvedValue(partialCacheResult)
-      vi.mocked(setup.installTools).mockResolvedValue([mockTools[0]]) // Only one installed successfully
+      vi.mocked(setup.installSpecificTools).mockResolvedValue([mockTools[0]]) // Only one installed successfully
 
       await run()
 
-      expect(setup.installTools).toHaveBeenCalledWith([mockTools[0], mockTools[1]])
-      expect(cache.saveAllCaches).toHaveBeenCalledWith(partialCacheResult, [mockTools[0]])
+      expect(setup.installSpecificTools).toHaveBeenCalledWith([
+        mockTools[0],
+        mockTools[1]
+      ])
+      expect(cache.saveAllCaches).toHaveBeenCalledWith(partialCacheResult, [
+        mockTools[0]
+      ])
       expect(core.info).toHaveBeenCalledWith(
-        expect.stringContaining('Installed tools: 1')
+        expect.stringContaining('⬇️  Tools installed: 1')
       )
     })
 
@@ -250,11 +278,11 @@ describe('main', () => {
 
       await run()
 
-      expect(core.setFailed).toHaveBeenCalledWith(`Action failed: ${unexpectedError.message}`)
+      expect(core.setFailed).toHaveBeenCalledWith(unexpectedError.message)
     })
 
     it('should handle async operation timing', async () => {
-      let resolveOrder: string[] = []
+      const resolveOrder: string[] = []
 
       vi.mocked(tools.getAllTools).mockImplementation(async () => {
         await new Promise(resolve => setTimeout(resolve, 10))
@@ -268,56 +296,67 @@ describe('main', () => {
         return mockCacheResult
       })
 
-      vi.mocked(setup.ensureMise).mockImplementation(async () => {
-        resolveOrder.push('ensureMise')
+      vi.mocked(setup.setupMise).mockImplementation(async () => {
+        resolveOrder.push('setupMise')
       })
 
       await run()
 
-      expect(resolveOrder).toEqual(['getAllTools', 'restoreAllCaches', 'ensureMise'])
+      expect(resolveOrder).toEqual([
+        'getAllTools',
+        'restoreAllCaches',
+        'setupMise'
+      ])
     })
 
     it('should handle complex error scenarios', async () => {
       // Test error in the middle of execution
-      vi.mocked(setup.installTools).mockImplementation(async () => {
+      vi.mocked(setup.installSpecificTools).mockImplementation(async () => {
         throw new Error('Installation failed after cache restore')
       })
 
       await run()
 
       expect(cache.restoreAllCaches).toHaveBeenCalled() // This should succeed
-      expect(setup.ensureMise).toHaveBeenCalled() // This should succeed
-      expect(setup.configMise).toHaveBeenCalled() // This should succeed
+      expect(setup.setupMise).toHaveBeenCalled() // This should succeed
+      expect(environment.setupEnvironmentVariables).toHaveBeenCalled() // This happens before the error
       expect(cache.saveAllCaches).not.toHaveBeenCalled() // This should not be called
-      expect(environment.setupEnvironment).not.toHaveBeenCalled() // This should not be called
       expect(core.setFailed).toHaveBeenCalledWith(
-        'Action failed: Installation failed after cache restore'
+        'Installation failed after cache restore'
       )
     })
   })
 
   describe('logging and output behavior', () => {
-    it('should log start message', async () => {
+    it('should log discovery message', async () => {
       await run()
 
-      expect(core.info).toHaveBeenCalledWith('Starting mise-action...')
+      expect(core.info).toHaveBeenCalledWith('Discovered 2 tools to manage')
     })
 
-    it('should log completion message on success', async () => {
+    it('should log execution summary on success', async () => {
       await run()
 
       expect(core.info).toHaveBeenCalledWith(
-        expect.stringContaining('mise-action completed successfully')
+        expect.stringContaining('🎉 Mise Action Execution Summary')
       )
     })
 
-    it('should not log completion message on failure', async () => {
+    it('should log cache efficiency in summary', async () => {
+      await run()
+
+      expect(core.info).toHaveBeenCalledWith(
+        expect.stringContaining('🚀 Cache efficiency:')
+      )
+    })
+
+    it('should not log execution summary on failure', async () => {
       vi.mocked(tools.getAllTools).mockRejectedValue(new Error('Test error'))
 
       await run()
 
       expect(core.info).not.toHaveBeenCalledWith(
-        expect.stringContaining('mise-action completed successfully')
+        expect.stringContaining('🎉 Mise Action Execution Summary')
       )
     })
 

@@ -66525,126 +66525,235 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.restoreMiseCache = restoreMiseCache;
-exports.saveMiseCache = saveMiseCache;
+exports.restoreAllCaches = restoreAllCaches;
+exports.saveAllCaches = saveAllCaches;
 const cache = __importStar(__nccwpck_require__(5116));
 const core = __importStar(__nccwpck_require__(7484));
-const glob = __importStar(__nccwpck_require__(7206));
-const crypto = __importStar(__nccwpck_require__(6982));
 const fs = __importStar(__nccwpck_require__(9896));
+const path = __importStar(__nccwpck_require__(6928));
 const utils_1 = __nccwpck_require__(1798);
+const tools_1 = __nccwpck_require__(1732);
 /**
- * Restore mise cache based on configuration files
+ * Restore both global mise cache and individual tool caches
  */
-async function restoreMiseCache() {
-    core.startGroup('Restoring mise cache');
+async function restoreAllCaches(tools) {
+    core.startGroup('Restoring caches');
     try {
-        const version = core.getInput('version');
-        const installArgs = core.getInput('install_args');
-        const { MISE_ENV } = process.env;
-        const cachePath = (0, utils_1.miseDir)();
-        const fileHash = await generateConfigHash();
         const systemInfo = await (0, utils_1.getSystemInfo)();
-        const prefix = core.getInput('cache_key_prefix') || 'mise-v0';
-        let primaryKey = `${prefix}-${systemInfo.target}-${fileHash}`;
-        if (version) {
-            primaryKey = `${primaryKey}-${version}`;
-        }
-        if (MISE_ENV) {
-            primaryKey = `${primaryKey}-${MISE_ENV}`;
-        }
-        if (installArgs) {
-            const toolsHash = generateToolsHash(installArgs);
-            primaryKey = `${primaryKey}-${toolsHash}`;
-        }
-        // Save state for later use
-        core.saveState('PRIMARY_KEY', primaryKey);
-        core.saveState('MISE_DIR', cachePath);
-        const cacheKey = await cache.restoreCache([cachePath], primaryKey);
-        core.setOutput('cache-hit', Boolean(cacheKey));
-        if (!cacheKey) {
-            core.info(`mise cache not found for ${primaryKey}`);
-            return primaryKey;
-        }
-        core.info(`mise cache restored from key: ${cacheKey}`);
-        return cacheKey;
+        const version = core.getInput('version') || 'latest';
+        const keyPrefix = core.getInput('cache_key_prefix') || 'mise-v1';
+        // Restore global mise cache
+        const globalCacheHit = await restoreGlobalMiseCache(systemInfo.target, version, keyPrefix);
+        // Restore individual tool caches
+        const toolCacheResults = await restoreToolCaches(tools, systemInfo.target, keyPrefix);
+        const cachedTools = toolCacheResults.filter(t => t.isRestored).length;
+        const missingTools = toolCacheResults
+            .filter(t => !t.isRestored)
+            .map(t => t.tool);
+        const result = {
+            globalCacheHit,
+            toolCacheResults,
+            totalTools: tools.length,
+            cachedTools,
+            missingTools
+        };
+        // Set outputs for GitHub Actions
+        setOutputs(result);
+        logCacheResults(result);
+        return result;
     }
     catch (error) {
-        core.warning(`Failed to restore mise cache: ${error}`);
-        core.setOutput('cache-hit', false);
-        return undefined;
+        core.warning(`Failed to restore caches: ${error}`);
+        return {
+            globalCacheHit: false,
+            toolCacheResults: tools.map(tool => ({
+                tool,
+                cacheKey: '',
+                cachePath: '',
+                isRestored: false
+            })),
+            totalTools: tools.length,
+            cachedTools: 0,
+            missingTools: tools
+        };
     }
     finally {
         core.endGroup();
     }
 }
 /**
- * Save mise cache
+ * Restore global mise binary cache
  */
-async function saveMiseCache(cacheKey) {
-    return core.group('Saving mise cache', async () => {
-        const cachePath = (0, utils_1.miseDir)();
-        if (!fs.existsSync(cachePath)) {
-            throw new Error(`Cache folder path does not exist on disk: ${cachePath}`);
+async function restoreGlobalMiseCache(target, version, keyPrefix) {
+    const globalCacheKey = `${keyPrefix}-${target}-${version}-global`;
+    const miseCachePath = path.join((0, utils_1.miseDir)(), 'bin');
+    core.info(`Checking global mise cache: ${globalCacheKey}`);
+    try {
+        const cacheKey = await cache.restoreCache([miseCachePath], globalCacheKey);
+        const hit = Boolean(cacheKey);
+        if (hit) {
+            core.info(`✓ Global mise cache restored: ${cacheKey}`);
         }
+        else {
+            core.info(`✗ Global mise cache not found`);
+        }
+        return hit;
+    }
+    catch (error) {
+        core.warning(`Failed to restore global mise cache: ${error}`);
+        return false;
+    }
+}
+/**
+ * Restore individual tool caches
+ */
+async function restoreToolCaches(tools, target, keyPrefix) {
+    const results = [];
+    for (const tool of tools) {
+        const toolHash = (0, tools_1.generateToolHash)(tool);
+        const toolCacheKey = `${keyPrefix}-${target}-tool-${toolHash}`;
+        const toolCachePath = path.join((0, utils_1.miseDir)(), 'installs', tool.name, tool.version);
+        core.info(`Checking tool cache: ${tool.name}@${tool.version}`);
         try {
-            const cacheId = await cache.saveCache([cachePath], cacheKey);
-            if (cacheId === -1) {
-                core.info('Cache not saved (already exists)');
-                return;
+            const cacheKey = await cache.restoreCache([toolCachePath], toolCacheKey);
+            const isRestored = Boolean(cacheKey);
+            if (isRestored) {
+                core.info(`  ✓ Restored from cache: ${cacheKey}`);
             }
-            core.info(`Cache saved from ${cachePath} with key: ${cacheKey}`);
+            else {
+                core.info(`  ✗ Not found in cache`);
+            }
+            results.push({
+                tool,
+                cacheKey: toolCacheKey,
+                cachePath: toolCachePath,
+                isRestored
+            });
         }
         catch (error) {
-            core.warning(`Failed to save mise cache: ${error}`);
+            core.warning(`Failed to restore cache for ${tool.name}: ${error}`);
+            results.push({
+                tool,
+                cacheKey: toolCacheKey,
+                cachePath: toolCachePath,
+                isRestored: false
+            });
         }
-    });
+    }
+    return results;
 }
 /**
- * Generate hash from configuration files
+ * Save caches for newly installed tools and global mise
  */
-async function generateConfigHash() {
-    const configPatterns = [
-        `**/.config/mise/config.toml`,
-        `**/.config/mise/config.lock`,
-        `**/.config/mise/config.*.toml`,
-        `**/.config/mise/config.*.lock`,
-        `**/.config/mise.toml`,
-        `**/.config/mise.lock`,
-        `**/.config/mise.*.toml`,
-        `**/.config/mise.*.lock`,
-        `**/.mise/config.toml`,
-        `**/.mise/config.lock`,
-        `**/.mise/config.*.toml`,
-        `**/.mise/config.*.lock`,
-        `**/mise/config.toml`,
-        `**/mise/config.lock`,
-        `**/mise/config.*.toml`,
-        `**/mise/config.*.lock`,
-        `**/.mise.toml`,
-        `**/.mise.lock`,
-        `**/.mise.*.toml`,
-        `**/.mise.*.lock`,
-        `**/mise.toml`,
-        `**/mise.lock`,
-        `**/mise.*.toml`,
-        `**/mise.*.lock`,
-        `**/.tool-versions`
-    ];
-    return await glob.hashFiles(configPatterns.join('\n'));
+async function saveAllCaches(cacheResult, installedTools) {
+    if (!core.getBooleanInput('cache_save')) {
+        core.info('Cache saving disabled, skipping...');
+        return;
+    }
+    core.startGroup('Saving caches');
+    try {
+        // Save global mise cache if it wasn't restored
+        if (!cacheResult.globalCacheHit) {
+            await saveGlobalMiseCache();
+        }
+        // Save caches for newly installed tools
+        for (const tool of installedTools) {
+            const toolCacheInfo = cacheResult.toolCacheResults.find(t => t.tool.name === tool.name && t.tool.version === tool.version);
+            if (toolCacheInfo && !toolCacheInfo.isRestored) {
+                await saveToolCache(toolCacheInfo);
+            }
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to save caches: ${error}`);
+    }
+    finally {
+        core.endGroup();
+    }
 }
 /**
- * Generate hash from tools in install arguments
+ * Save global mise binary cache
  */
-function generateToolsHash(installArgs) {
-    const tools = installArgs
-        .split(' ')
-        .filter((arg) => !arg.startsWith('-'))
-        .sort()
-        .join(' ');
-    if (!tools)
-        return '';
-    return crypto.createHash('sha256').update(tools).digest('hex');
+async function saveGlobalMiseCache() {
+    const systemInfo = await (0, utils_1.getSystemInfo)();
+    const version = core.getInput('version') || 'latest';
+    const keyPrefix = core.getInput('cache_key_prefix') || 'mise-v1';
+    const globalCacheKey = `${keyPrefix}-${systemInfo.target}-${version}-global`;
+    const miseCachePath = path.join((0, utils_1.miseDir)(), 'bin');
+    if (!fs.existsSync(miseCachePath)) {
+        core.warning(`Global mise path does not exist: ${miseCachePath}`);
+        return;
+    }
+    try {
+        const cacheId = await cache.saveCache([miseCachePath], globalCacheKey);
+        if (cacheId !== -1) {
+            core.info(`✓ Global mise cache saved: ${globalCacheKey}`);
+        }
+        else {
+            core.info(`Global mise cache already exists: ${globalCacheKey}`);
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to save global mise cache: ${error}`);
+    }
+}
+/**
+ * Save individual tool cache
+ */
+async function saveToolCache(toolCacheInfo) {
+    const { tool, cacheKey, cachePath } = toolCacheInfo;
+    if (!fs.existsSync(cachePath)) {
+        core.warning(`Tool cache path does not exist for ${tool.name}@${tool.version}: ${cachePath}`);
+        return;
+    }
+    try {
+        const cacheId = await cache.saveCache([cachePath], cacheKey);
+        if (cacheId !== -1) {
+            core.info(`✓ Tool cache saved: ${tool.name}@${tool.version}`);
+        }
+        else {
+            core.info(`Tool cache already exists: ${tool.name}@${tool.version}`);
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to save tool cache for ${tool.name}: ${error}`);
+    }
+}
+/**
+ * Set GitHub Actions outputs based on cache results
+ */
+function setOutputs(result) {
+    const { totalTools, cachedTools, globalCacheHit } = result;
+    // Traditional cache-hit output (true only if ALL tools were cached)
+    const fullCacheHit = globalCacheHit && cachedTools === totalTools;
+    core.setOutput('cache-hit', fullCacheHit);
+    // New enhanced outputs
+    core.setOutput('global-cache-hit', globalCacheHit);
+    core.setOutput('partial-cache-hit', cachedTools > 0);
+    core.setOutput('tools-cache-hit-ratio', `${cachedTools}/${totalTools}`);
+    core.setOutput('cached-tools-count', cachedTools);
+    core.setOutput('missing-tools-count', totalTools - cachedTools);
+}
+/**
+ * Log detailed cache results
+ */
+function logCacheResults(result) {
+    const { totalTools, cachedTools, globalCacheHit, missingTools } = result;
+    core.info(`\n📊 Cache Results Summary:`);
+    core.info(`  Global mise cache: ${globalCacheHit ? '✓ Hit' : '✗ Miss'}`);
+    core.info(`  Tool caches: ${cachedTools}/${totalTools} restored`);
+    if (cachedTools > 0) {
+        core.info(`\n✅ Restored from cache:`);
+        result.toolCacheResults
+            .filter(t => t.isRestored)
+            .forEach(t => core.info(`  - ${t.tool.name}@${t.tool.version}`));
+    }
+    if (missingTools.length > 0) {
+        core.info(`\n⚠️  Need to install:`);
+        missingTools.forEach(tool => core.info(`  - ${tool.name}@${tool.version}`));
+    }
+    const cacheEfficiency = totalTools > 0 ? (cachedTools / totalTools) * 100 : 0;
+    core.info(`\n🎯 Cache efficiency: ${cacheEfficiency.toFixed(1)}%`);
 }
 
 
@@ -66773,9 +66882,12 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.run = run;
 const core = __importStar(__nccwpck_require__(7484));
+const path = __importStar(__nccwpck_require__(6928));
 const environment_1 = __nccwpck_require__(2678);
 const setup_1 = __nccwpck_require__(8294);
 const cache_1 = __nccwpck_require__(7377);
+const tools_1 = __nccwpck_require__(1732);
+const utils_1 = __nccwpck_require__(1798);
 /**
  * Main entry point for the mise action
  */
@@ -66783,36 +66895,77 @@ async function run() {
     try {
         // Parse configuration from inputs
         const config = parseConfiguration();
-        // Set up configuration files
+        // Set up configuration files first
         await setupConfigurationFiles(config);
-        // Handle caching
-        let cacheKey;
+        // Parse all tools from various sources
+        const allTools = await (0, tools_1.getAllTools)();
+        core.info(`Discovered ${allTools.length} tools to manage`);
+        // Handle caching - restore both global and per-tool caches
+        let cacheResult;
         if (core.getBooleanInput('cache')) {
-            cacheKey = await (0, cache_1.restoreMiseCache)();
+            cacheResult = await (0, cache_1.restoreAllCaches)(allTools);
         }
         else {
             core.setOutput('cache-hit', false);
+            core.setOutput('global-cache-hit', false);
+            core.setOutput('partial-cache-hit', false);
+            core.setOutput('tools-cache-hit-ratio', '0/0');
+            cacheResult = {
+                globalCacheHit: false,
+                toolCacheResults: [],
+                totalTools: allTools.length,
+                cachedTools: 0,
+                missingTools: allTools
+            };
         }
-        // Set up mise binary
-        await (0, setup_1.setupMise)(config.version);
+        // Set up mise binary (skip if restored from global cache)
+        if (!cacheResult.globalCacheHit) {
+            await (0, setup_1.setupMise)(config.version);
+        }
+        else {
+            core.info('Mise binary restored from cache, skipping installation');
+            // Still need to add to PATH
+            const miseBinDir = path.join((0, utils_1.miseDir)(), 'bin');
+            core.addPath(miseBinDir);
+        }
         // Set up environment variables
         await (0, environment_1.setupEnvironmentVariables)(config);
-        // Reshim if requested
+        // Trust current directory for mise configuration
+        await (0, setup_1.trustCurrentDirectory)();
+        // Test mise installation
+        await (0, setup_1.testMise)();
+        // Reshim if requested (before installing new tools)
         if (core.getBooleanInput('reshim')) {
             await (0, setup_1.reshimTools)();
         }
-        // Test mise installation
-        await (0, setup_1.testMise)();
-        // Install tools if requested
+        // Install tools based on caching results
+        let installedTools = [];
         if (core.getBooleanInput('install')) {
-            await (0, setup_1.installTools)(config.installArgs);
-            // Save cache if enabled and we have a cache key
-            if (cacheKey && core.getBooleanInput('cache_save')) {
-                await (0, cache_1.saveMiseCache)(cacheKey);
+            if (cacheResult.missingTools.length > 0) {
+                core.info(`Installing ${cacheResult.missingTools.length} tools that weren't found in cache`);
+                installedTools = await (0, setup_1.installSpecificTools)(cacheResult.missingTools);
+            }
+            else {
+                core.info('All tools were restored from cache, no installation needed');
+            }
+            // Fallback: if no tools were specified but install is requested
+            if (allTools.length === 0 && core.getInput('install_args')) {
+                core.info('No tools found in configuration, falling back to install_args');
+                await (0, setup_1.installAllConfiguredTools)();
+            }
+            // Save cache for newly installed tools
+            if (core.getBooleanInput('cache') && installedTools.length > 0) {
+                await (0, cache_1.saveAllCaches)(cacheResult, installedTools);
             }
         }
-        // List installed tools
+        // Final reshim after installing new tools
+        if (core.getBooleanInput('reshim') && installedTools.length > 0) {
+            await (0, setup_1.reshimTools)();
+        }
+        // List installed tools for verification
         await (0, setup_1.listTools)();
+        // Log final summary
+        logExecutionSummary(cacheResult, installedTools.length);
     }
     catch (err) {
         if (err instanceof Error) {
@@ -66845,6 +66998,22 @@ function parseConfiguration() {
 async function setupConfigurationFiles(config) {
     await (0, setup_1.setupToolVersions)(config);
     await (0, setup_1.setupMiseToml)(config);
+}
+/**
+ * Log execution summary
+ */
+function logExecutionSummary(cacheResult, installedCount) {
+    core.info('\n🎉 Mise Action Execution Summary:');
+    core.info(`  📦 Total tools managed: ${cacheResult.totalTools}`);
+    core.info(`  ♻️  Tools restored from cache: ${cacheResult.cachedTools}`);
+    core.info(`  ⬇️  Tools installed: ${installedCount}`);
+    core.info(`  🚀 Cache efficiency: ${cacheResult.totalTools > 0 ? ((cacheResult.cachedTools / cacheResult.totalTools) * 100).toFixed(1) : 0}%`);
+    if (cacheResult.totalTools > 0) {
+        const timesSaved = cacheResult.cachedTools;
+        if (timesSaved > 0) {
+            core.info(`  ⏱️  Estimated time saved: ~${timesSaved * 30}s (assuming 30s per tool)`);
+        }
+    }
 }
 
 
@@ -66895,8 +67064,11 @@ exports.setupMiseToml = setupMiseToml;
 exports.executeMiseCommand = executeMiseCommand;
 exports.testMise = testMise;
 exports.installTools = installTools;
+exports.installSpecificTools = installSpecificTools;
+exports.installAllConfiguredTools = installAllConfiguredTools;
 exports.listTools = listTools;
 exports.reshimTools = reshimTools;
+exports.trustCurrentDirectory = trustCurrentDirectory;
 const core = __importStar(__nccwpck_require__(7484));
 const exec = __importStar(__nccwpck_require__(5236));
 const io = __importStar(__nccwpck_require__(4994));
@@ -67039,11 +67211,60 @@ async function testMise() {
     return executeMiseCommand(['--version']);
 }
 /**
- * Install tools using mise
+ * Install all tools using mise install
+ * @deprecated Use installSpecificTools for selective installation
  */
 async function installTools(installArgs) {
     const args = installArgs ? `install ${installArgs}` : 'install';
     return executeMiseCommand([args]);
+}
+/**
+ * Install only specific tools that weren't restored from cache
+ */
+async function installSpecificTools(tools) {
+    if (tools.length === 0) {
+        core.info('No tools to install');
+        return [];
+    }
+    core.startGroup(`Installing ${tools.length} tools`);
+    const installedTools = [];
+    try {
+        // Install tools one by one for better error handling and caching
+        for (const tool of tools) {
+            try {
+                core.info(`Installing ${tool.name}@${tool.version}...`);
+                const result = await executeMiseCommand([
+                    'install',
+                    `${tool.name}@${tool.version}`
+                ]);
+                if (result === 0) {
+                    core.info(`✓ Successfully installed ${tool.name}@${tool.version}`);
+                    installedTools.push(tool);
+                }
+                else {
+                    core.warning(`Failed to install ${tool.name}@${tool.version}`);
+                }
+            }
+            catch (error) {
+                core.warning(`Error installing ${tool.name}@${tool.version}: ${error}`);
+            }
+        }
+        core.info(`Successfully installed ${installedTools.length}/${tools.length} tools`);
+    }
+    catch (error) {
+        core.error(`Failed to install tools: ${error}`);
+    }
+    finally {
+        core.endGroup();
+    }
+    return installedTools;
+}
+/**
+ * Install all tools from configuration (fallback method)
+ */
+async function installAllConfiguredTools() {
+    core.info('Installing all tools from configuration...');
+    return executeMiseCommand(['install']);
 }
 /**
  * List installed tools
@@ -67056,6 +67277,282 @@ async function listTools() {
  */
 async function reshimTools() {
     return executeMiseCommand(['reshim', '--all']);
+}
+/**
+ * Trust the current directory for mise configuration
+ */
+async function trustCurrentDirectory() {
+    const cwd = (0, utils_1.getWorkingDirectory)();
+    core.info(`Trusting directory: ${cwd}`);
+    return executeMiseCommand(['trust', cwd]);
+}
+
+
+/***/ }),
+
+/***/ 1732:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.getAllTools = getAllTools;
+exports.generateToolHash = generateToolHash;
+exports.toolsToInstallArgs = toolsToInstallArgs;
+const core = __importStar(__nccwpck_require__(7484));
+const fs = __importStar(__nccwpck_require__(9896));
+const glob = __importStar(__nccwpck_require__(7206));
+/**
+ * Parse and collect all tools from various configuration sources
+ */
+async function getAllTools() {
+    const tools = [];
+    // Parse from install_args parameter
+    const installArgsTools = parseInstallArgs();
+    tools.push(...installArgsTools);
+    // Parse from .tool-versions files
+    const toolVersionsTools = await parseToolVersionsFiles();
+    tools.push(...toolVersionsTools);
+    // Parse from mise.toml files
+    const miseTomlTools = await parseMiseTomlFiles();
+    tools.push(...miseTomlTools);
+    // Remove duplicates, preferring more specific sources
+    const uniqueTools = deduplicateTools(tools);
+    core.info(`Found ${uniqueTools.length} tools to manage`);
+    uniqueTools.forEach(tool => {
+        core.info(`  - ${tool.name}@${tool.version} (from ${tool.source})`);
+    });
+    return uniqueTools;
+}
+/**
+ * Parse tools from install_args input parameter
+ */
+function parseInstallArgs() {
+    const installArgs = core.getInput('install_args');
+    if (!installArgs)
+        return [];
+    const tools = [];
+    const args = installArgs
+        .split(' ')
+        .filter(arg => arg.trim() && !arg.startsWith('-'));
+    for (const arg of args) {
+        const tool = parseToolSpec(arg, 'install_args');
+        if (tool)
+            tools.push(tool);
+    }
+    return tools;
+}
+/**
+ * Parse tools from all .tool-versions files
+ */
+async function parseToolVersionsFiles() {
+    const tools = [];
+    try {
+        const globber = await glob.create('**/.tool-versions', {
+            followSymbolicLinks: false
+        });
+        const files = await globber.glob();
+        for (const file of files) {
+            const fileTools = await parseToolVersionsFile(file);
+            tools.push(...fileTools);
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to parse .tool-versions files: ${error}`);
+    }
+    return tools;
+}
+/**
+ * Parse a single .tool-versions file
+ */
+async function parseToolVersionsFile(filePath) {
+    const tools = [];
+    try {
+        const content = await fs.promises.readFile(filePath, 'utf8');
+        const lines = content
+            .split('\n')
+            .filter(line => line.trim() && !line.startsWith('#'));
+        for (const line of lines) {
+            const [name, version] = line.trim().split(/\s+/);
+            if (name && version) {
+                tools.push({ name, version, source: '.tool-versions' });
+            }
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to parse ${filePath}: ${error}`);
+    }
+    return tools;
+}
+/**
+ * Parse tools from all mise.toml files
+ */
+async function parseMiseTomlFiles() {
+    const tools = [];
+    try {
+        const globber = await glob.create('**/mise.toml', {
+            followSymbolicLinks: false
+        });
+        const files = await globber.glob();
+        for (const file of files) {
+            const fileTools = await parseMiseTomlFile(file);
+            tools.push(...fileTools);
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to parse mise.toml files: ${error}`);
+    }
+    return tools;
+}
+/**
+ * Parse a single mise.toml file
+ * This is a simplified parser that handles basic [tools] sections
+ */
+async function parseMiseTomlFile(filePath) {
+    const tools = [];
+    try {
+        const content = await fs.promises.readFile(filePath, 'utf8');
+        const lines = content.split('\n');
+        let inToolsSection = false;
+        for (const line of lines) {
+            const trimmed = line.trim();
+            // Check for [tools] section
+            if (trimmed === '[tools]') {
+                inToolsSection = true;
+                continue;
+            }
+            // Check for new section
+            if (trimmed.startsWith('[') && trimmed !== '[tools]') {
+                inToolsSection = false;
+                continue;
+            }
+            // Parse tool entries in [tools] section
+            if (inToolsSection && trimmed && !trimmed.startsWith('#')) {
+                const tool = parseTomlToolLine(trimmed);
+                if (tool)
+                    tools.push(tool);
+            }
+        }
+    }
+    catch (error) {
+        core.warning(`Failed to parse ${filePath}: ${error}`);
+    }
+    return tools;
+}
+/**
+ * Parse a single tool line from TOML format
+ * Supports formats like: node = "18.17.0", python = {version = "3.11.0"}
+ */
+function parseTomlToolLine(line) {
+    try {
+        const match = line.match(/^(\w+)\s*=\s*(.+)$/);
+        if (!match)
+            return null;
+        const [, name, value] = match;
+        let version;
+        // Handle simple string format: node = "18.17.0"
+        const stringMatch = value.match(/^["']([^"']+)["']$/);
+        if (stringMatch) {
+            version = stringMatch[1];
+        }
+        else {
+            // Handle object format: python = {version = "3.11.0"}
+            const objectMatch = value.match(/version\s*=\s*["']([^"']+)["']/);
+            if (objectMatch) {
+                version = objectMatch[1];
+            }
+            else {
+                return null;
+            }
+        }
+        return { name, version, source: 'mise.toml' };
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Parse a tool specification (e.g., "node@18.17.0", "python@3.11")
+ */
+function parseToolSpec(spec, source) {
+    try {
+        const parts = spec.split('@');
+        if (parts.length !== 2)
+            return null;
+        const [name, version] = parts;
+        if (!name || !version)
+            return null;
+        return { name: name.trim(), version: version.trim(), source };
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Remove duplicate tools, preferring more specific sources
+ * Priority: install_args > mise.toml > .tool-versions
+ */
+function deduplicateTools(tools) {
+    const toolMap = new Map();
+    const sourcePriority = {
+        install_args: 3,
+        'mise.toml': 2,
+        '.tool-versions': 1
+    };
+    for (const tool of tools) {
+        const key = tool.name;
+        const existing = toolMap.get(key);
+        if (!existing ||
+            sourcePriority[tool.source] > sourcePriority[existing.source]) {
+            toolMap.set(key, tool);
+        }
+    }
+    return Array.from(toolMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+/**
+ * Generate a stable hash for a tool based on name and version
+ */
+function generateToolHash(tool) {
+    return `${tool.name}-${tool.version}`;
+}
+/**
+ * Convert tools list to mise install command arguments
+ */
+function toolsToInstallArgs(tools) {
+    return tools.map(tool => `${tool.name}@${tool.version}`).join(' ');
 }
 
 

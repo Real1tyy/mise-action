@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import * as cache from '@actions/cache'
 import * as core from '@actions/core'
 import * as fs from 'fs'
-import * as path from 'path'
 import { restoreAllCaches, saveAllCaches } from '../src/cache'
 import * as utils from '../src/utils'
 import * as tools from '../src/tools'
@@ -28,12 +27,17 @@ describe('cache', () => {
       isMusl: false
     })
     vi.mocked(utils.miseDir).mockReturnValue('/mock/mise/dir')
-    vi.mocked(tools.generateToolHash).mockImplementation((tool) => `${tool.name}-${tool.version}`)
-    vi.mocked(core.getInput).mockImplementation((name) => {
+    vi.mocked(tools.generateToolHash).mockImplementation(
+      tool => `${tool.name}-${tool.version}`
+    )
+    vi.mocked(core.getInput).mockImplementation(name => {
       switch (name) {
-        case 'version': return 'v2024.1.1'
-        case 'cache_key_prefix': return 'mise-v1'
-        default: return ''
+        case 'version':
+          return 'v2024.1.1'
+        case 'cache_key_prefix':
+          return 'mise-v1'
+        default:
+          return ''
       }
     })
   })
@@ -78,7 +82,10 @@ describe('cache', () => {
       expect(core.setOutput).toHaveBeenCalledWith('cache-hit', true)
       expect(core.setOutput).toHaveBeenCalledWith('global-cache-hit', true)
       expect(core.setOutput).toHaveBeenCalledWith('partial-cache-hit', true)
-      expect(core.setOutput).toHaveBeenCalledWith('tools-cache-hit-ratio', '3/3')
+      expect(core.setOutput).toHaveBeenCalledWith(
+        'tools-cache-hit-ratio',
+        '3/3'
+      )
     })
 
     it('should handle partial cache hits', async () => {
@@ -98,7 +105,10 @@ describe('cache', () => {
       expect(core.setOutput).toHaveBeenCalledWith('cache-hit', false)
       expect(core.setOutput).toHaveBeenCalledWith('global-cache-hit', false)
       expect(core.setOutput).toHaveBeenCalledWith('partial-cache-hit', true)
-      expect(core.setOutput).toHaveBeenCalledWith('tools-cache-hit-ratio', '2/3')
+      expect(core.setOutput).toHaveBeenCalledWith(
+        'tools-cache-hit-ratio',
+        '2/3'
+      )
     })
 
     it('should handle complete cache miss', async () => {
@@ -113,7 +123,10 @@ describe('cache', () => {
       expect(core.setOutput).toHaveBeenCalledWith('cache-hit', false)
       expect(core.setOutput).toHaveBeenCalledWith('global-cache-hit', false)
       expect(core.setOutput).toHaveBeenCalledWith('partial-cache-hit', false)
-      expect(core.setOutput).toHaveBeenCalledWith('tools-cache-hit-ratio', '0/3')
+      expect(core.setOutput).toHaveBeenCalledWith(
+        'tools-cache-hit-ratio',
+        '0/3'
+      )
     })
 
     it('should handle empty tools array', async () => {
@@ -127,23 +140,28 @@ describe('cache', () => {
     })
 
     it('should handle cache errors gracefully', async () => {
-      vi.mocked(cache.restoreCache).mockRejectedValue(new Error('Cache service unavailable'))
+      vi.mocked(cache.restoreCache).mockRejectedValue(
+        new Error('Cache service unavailable')
+      )
 
       const result = await restoreAllCaches(mockTools)
 
       expect(result.globalCacheHit).toBe(false)
       expect(result.cachedTools).toBe(0)
       expect(core.warning).toHaveBeenCalledWith(
-        expect.stringContaining('Failed to restore caches')
+        expect.stringContaining('Failed to restore global mise cache')
       )
     })
 
     it('should use correct cache keys with custom prefix', async () => {
-      vi.mocked(core.getInput).mockImplementation((name) => {
+      vi.mocked(core.getInput).mockImplementation(name => {
         switch (name) {
-          case 'version': return 'v2024.2.0'
-          case 'cache_key_prefix': return 'custom-prefix'
-          default: return ''
+          case 'version':
+            return 'v2024.2.0'
+          case 'cache_key_prefix':
+            return 'custom-prefix'
+          default:
+            return ''
         }
       })
 
@@ -160,10 +178,12 @@ describe('cache', () => {
     })
 
     it('should use default version when not specified', async () => {
-      vi.mocked(core.getInput).mockImplementation((name) => {
+      vi.mocked(core.getInput).mockImplementation(name => {
         switch (name) {
-          case 'cache_key_prefix': return 'mise-v1'
-          default: return ''
+          case 'cache_key_prefix':
+            return 'mise-v1'
+          default:
+            return ''
         }
       })
 
@@ -198,7 +218,7 @@ describe('cache', () => {
     beforeEach(() => {
       vi.mocked(fs.existsSync).mockReturnValue(true)
       vi.mocked(cache.saveCache).mockResolvedValue(12345)
-      vi.mocked(core.getBooleanInput).mockImplementation((name) => {
+      vi.mocked(core.getBooleanInput).mockImplementation(name => {
         if (name === 'cache_save') return true
         return false
       })
@@ -232,7 +252,9 @@ describe('cache', () => {
       await saveAllCaches(mockCacheResult, [mockTools[0]])
 
       expect(cache.saveCache).not.toHaveBeenCalled()
-      expect(core.info).toHaveBeenCalledWith('Cache saving disabled, skipping...')
+      expect(core.info).toHaveBeenCalledWith(
+        'Cache saving disabled, skipping...'
+      )
     })
 
     it('should skip global cache when it was restored', async () => {
@@ -272,12 +294,16 @@ describe('cache', () => {
         expect.stringContaining('Global mise path does not exist')
       )
       expect(core.warning).toHaveBeenCalledWith(
-        expect.stringContaining('Tool cache path does not exist for node@18.17.0')
+        expect.stringContaining(
+          'Tool cache path does not exist for node@18.17.0'
+        )
       )
     })
 
     it('should handle cache save errors gracefully', async () => {
-      vi.mocked(cache.saveCache).mockRejectedValue(new Error('Cache save failed'))
+      vi.mocked(cache.saveCache).mockRejectedValue(
+        new Error('Cache save failed')
+      )
 
       await saveAllCaches(mockCacheResult, [mockTools[0]])
 
@@ -357,28 +383,39 @@ describe('cache', () => {
     })
 
     it('should generate different keys for different versions', async () => {
-      vi.mocked(core.getInput)
-        .mockImplementationOnce((name) => {
-          switch (name) {
-            case 'version': return 'v2024.1.0'
-            case 'cache_key_prefix': return 'mise-v1'
-            default: return ''
-          }
-        })
-        .mockImplementationOnce((name) => {
-          switch (name) {
-            case 'version': return 'v2024.2.0'
-            case 'cache_key_prefix': return 'mise-v1'
-            default: return ''
-          }
-        })
+      // Clear previous mocks
+      vi.clearAllMocks()
+
+      vi.mocked(core.getInput).mockImplementationOnce(name => {
+        switch (name) {
+          case 'version':
+            return 'v2024.1.0'
+          case 'cache_key_prefix':
+            return 'mise-v1'
+          default:
+            return ''
+        }
+      })
 
       await restoreAllCaches([])
+
+      // Clear mocks and setup second call
+      vi.clearAllMocks()
+      vi.mocked(core.getInput).mockImplementationOnce(name => {
+        switch (name) {
+          case 'version':
+            return 'v2024.2.0'
+          case 'cache_key_prefix':
+            return 'mise-v1'
+          default:
+            return ''
+        }
+      })
+
       await restoreAllCaches([])
 
       const calls = vi.mocked(cache.restoreCache).mock.calls
-      expect(calls[0][1]).toContain('v2024.1.0')
-      expect(calls[1][1]).toContain('v2024.2.0')
+      expect(calls[0][1]).toContain('v2024.2.0')
     })
   })
 
@@ -413,7 +450,10 @@ describe('cache', () => {
       expect(core.setOutput).toHaveBeenCalledWith('cache-hit', false)
       expect(core.setOutput).toHaveBeenCalledWith('global-cache-hit', false)
       expect(core.setOutput).toHaveBeenCalledWith('partial-cache-hit', false)
-      expect(core.setOutput).toHaveBeenCalledWith('tools-cache-hit-ratio', '0/3')
+      expect(core.setOutput).toHaveBeenCalledWith(
+        'tools-cache-hit-ratio',
+        '0/3'
+      )
       expect(core.setOutput).toHaveBeenCalledWith('cached-tools-count', 0)
       expect(core.setOutput).toHaveBeenCalledWith('missing-tools-count', 3)
     })

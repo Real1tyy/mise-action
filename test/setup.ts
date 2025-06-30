@@ -78,13 +78,19 @@ vi.mock('crypto', () => ({
 
 // Global test utilities
 Object.assign(globalThis, {
-  createMockTool: (name: string, version: string, source: Tool['source'] = 'mise.toml'): Tool => ({
+  createMockTool: (
+    name: string,
+    version: string,
+    source: Tool['source'] = 'mise.toml'
+  ): Tool => ({
     name,
     version,
     source
   }),
 
-  createMockCacheResult: (overrides: Partial<CacheResult> = {}): CacheResult => ({
+  createMockCacheResult: (
+    overrides: Partial<CacheResult> = {}
+  ): CacheResult => ({
     globalCacheHit: false,
     toolCacheResults: [],
     totalTools: 0,

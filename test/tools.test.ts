@@ -3,6 +3,7 @@ import * as core from '@actions/core'
 import * as glob from '@actions/glob'
 import * as fs from 'fs'
 import { getAllTools, generateToolHash, toolsToInstallArgs } from '../src/tools'
+import type { Globber } from '@actions/glob'
 
 describe('tools', () => {
   beforeEach(() => {
@@ -11,14 +12,14 @@ describe('tools', () => {
 
   describe('getAllTools', () => {
     it('should parse tools from install_args', async () => {
-      vi.mocked(core.getInput).mockImplementation((name) => {
+      vi.mocked(core.getInput).mockImplementation(name => {
         if (name === 'install_args') return 'node@18.17.0 python@3.11.0'
         return ''
       })
 
       vi.mocked(glob.create).mockResolvedValue({
         glob: vi.fn().mockResolvedValue([])
-      } as any)
+      } as unknown as Globber)
 
       const result = await getAllTools()
 
@@ -41,7 +42,9 @@ describe('tools', () => {
       const mockGlobber = {
         glob: vi.fn().mockResolvedValue(['.tool-versions'])
       }
-      vi.mocked(glob.create).mockResolvedValue(mockGlobber as any)
+      vi.mocked(glob.create).mockResolvedValue(
+        mockGlobber as unknown as Globber
+      )
 
       vi.mocked(fs.promises.readFile).mockResolvedValue(
         'node 18.17.0\npython 3.11.0\n# comment line\nruby 3.2.0'
@@ -71,11 +74,14 @@ describe('tools', () => {
       vi.mocked(core.getInput).mockReturnValue('')
 
       const mockGlobber = {
-        glob: vi.fn()
+        glob: vi
+          .fn()
           .mockResolvedValueOnce([]) // .tool-versions
           .mockResolvedValueOnce(['mise.toml']) // mise.toml
       }
-      vi.mocked(glob.create).mockResolvedValue(mockGlobber as any)
+      vi.mocked(glob.create).mockResolvedValue(
+        mockGlobber as unknown as Globber
+      )
 
       vi.mocked(fs.promises.readFile).mockResolvedValue(`
 [tools]
@@ -109,19 +115,23 @@ NODE_ENV = "development"
     })
 
     it('should deduplicate tools with preference order', async () => {
-      vi.mocked(core.getInput).mockImplementation((name) => {
+      vi.mocked(core.getInput).mockImplementation(name => {
         if (name === 'install_args') return 'node@20.0.0'
         return ''
       })
 
       const mockGlobber = {
-        glob: vi.fn()
+        glob: vi
+          .fn()
           .mockResolvedValueOnce(['.tool-versions'])
           .mockResolvedValueOnce(['mise.toml'])
       }
-      vi.mocked(glob.create).mockResolvedValue(mockGlobber as any)
+      vi.mocked(glob.create).mockResolvedValue(
+        mockGlobber as unknown as Globber
+      )
 
-      vi.mocked(fs.promises.readFile)
+      vi
+        .mocked(fs.promises.readFile)
         .mockResolvedValueOnce('node 18.17.0\npython 3.11.0') // .tool-versions
         .mockResolvedValueOnce(`
 [tools]
@@ -154,7 +164,7 @@ go = "1.21.0"
       vi.mocked(core.getInput).mockReturnValue('')
       vi.mocked(glob.create).mockResolvedValue({
         glob: vi.fn().mockResolvedValue([])
-      } as any)
+      } as unknown as Globber)
 
       const result = await getAllTools()
 
@@ -167,9 +177,13 @@ go = "1.21.0"
       const mockGlobber = {
         glob: vi.fn().mockResolvedValue(['.tool-versions'])
       }
-      vi.mocked(glob.create).mockResolvedValue(mockGlobber as any)
+      vi.mocked(glob.create).mockResolvedValue(
+        mockGlobber as unknown as Globber
+      )
 
-      vi.mocked(fs.promises.readFile).mockRejectedValue(new Error('File not found'))
+      vi.mocked(fs.promises.readFile).mockRejectedValue(
+        new Error('File not found')
+      )
 
       const result = await getAllTools()
 
@@ -180,14 +194,14 @@ go = "1.21.0"
     })
 
     it('should skip invalid tool specifications', async () => {
-      vi.mocked(core.getInput).mockImplementation((name) => {
+      vi.mocked(core.getInput).mockImplementation(name => {
         if (name === 'install_args') return 'node@18.17.0 invalid-spec python'
         return ''
       })
 
       vi.mocked(glob.create).mockResolvedValue({
         glob: vi.fn().mockResolvedValue([])
-      } as any)
+      } as unknown as Globber)
 
       const result = await getAllTools()
 
@@ -200,14 +214,14 @@ go = "1.21.0"
     })
 
     it('should sort tools alphabetically', async () => {
-      vi.mocked(core.getInput).mockImplementation((name) => {
+      vi.mocked(core.getInput).mockImplementation(name => {
         if (name === 'install_args') return 'zebra@1.0.0 alpha@2.0.0 beta@3.0.0'
         return ''
       })
 
       vi.mocked(glob.create).mockResolvedValue({
         glob: vi.fn().mockResolvedValue([])
-      } as any)
+      } as unknown as Globber)
 
       const result = await getAllTools()
 
@@ -278,11 +292,14 @@ go = "1.21.0"
       vi.mocked(core.getInput).mockReturnValue('')
 
       const mockGlobber = {
-        glob: vi.fn()
+        glob: vi
+          .fn()
           .mockResolvedValueOnce([])
           .mockResolvedValueOnce(['mise.toml'])
       }
-      vi.mocked(glob.create).mockResolvedValue(mockGlobber as any)
+      vi.mocked(glob.create).mockResolvedValue(
+        mockGlobber as unknown as Globber
+      )
 
       vi.mocked(fs.promises.readFile).mockResolvedValue(`
 [other_section]
@@ -319,11 +336,14 @@ something = "value"
       vi.mocked(core.getInput).mockReturnValue('')
 
       const mockGlobber = {
-        glob: vi.fn()
+        glob: vi
+          .fn()
           .mockResolvedValueOnce([])
           .mockResolvedValueOnce(['mise.toml'])
       }
-      vi.mocked(glob.create).mockResolvedValue(mockGlobber as any)
+      vi.mocked(glob.create).mockResolvedValue(
+        mockGlobber as unknown as Globber
+      )
 
       vi.mocked(fs.promises.readFile).mockResolvedValue(`
 [tools]

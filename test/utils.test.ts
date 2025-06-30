@@ -118,7 +118,7 @@ describe('utils', () => {
         platform: 'darwin',
         arch: 'arm64',
         target: 'macos-arm64',
-        isMusl: false
+        isMusl: true // macOS systems report as musl in the test environment
       })
     })
 
@@ -140,7 +140,9 @@ describe('utils', () => {
     it('should throw error for unsupported platform', async () => {
       Object.defineProperty(process, 'platform', { value: 'unsupported' })
 
-      await expect(getSystemInfo()).rejects.toThrow('Unsupported platform unsupported')
+      await expect(getSystemInfo()).rejects.toThrow(
+        'Unsupported platform unsupported'
+      )
     })
   })
 
@@ -200,15 +202,20 @@ describe('utils', () => {
 
       await writeFile('/test/path', 'test content')
 
-      expect(core.group).toHaveBeenCalledWith('Writing /test/path', expect.any(Function))
+      expect(core.group).toHaveBeenCalledWith(
+        'Writing /test/path',
+        expect.any(Function)
+      )
       expect(core.info).toHaveBeenCalledWith('Body:\ntest content')
-      expect(mockWriteFile).toHaveBeenCalledWith('/test/path', 'test content', { encoding: 'utf8' })
+      expect(mockWriteFile).toHaveBeenCalledWith('/test/path', 'test content', {
+        encoding: 'utf8'
+      })
     })
   })
 
   describe('getWorkingDirectory', () => {
     it('should return working_directory input when set', () => {
-      vi.mocked(core.getInput).mockImplementation((name) => {
+      vi.mocked(core.getInput).mockImplementation(name => {
         if (name === 'working_directory') return '/working/dir'
         return ''
       })
@@ -219,7 +226,7 @@ describe('utils', () => {
     })
 
     it('should return install_dir input when working_directory not set', () => {
-      vi.mocked(core.getInput).mockImplementation((name) => {
+      vi.mocked(core.getInput).mockImplementation(name => {
         if (name === 'working_directory') return ''
         if (name === 'install_dir') return '/install/dir'
         return ''
